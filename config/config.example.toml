@@ -1,0 +1,29 @@
+# Minimal Codex config fragment that fixes the "Reconnecting 1/5 .. 5/5" loop.
+#
+# Merge the keys below into your own ~/.codex/config.toml.
+# Do NOT overwrite the whole file - Codex stores your plugins, trusted projects
+# and desktop preferences there too.
+#
+# Notes
+#   * The file must be UTF-8 WITHOUT BOM. A BOM makes the TOML parser fail and
+#     Codex then behaves as if there were no config at all.
+#   * Do not add or change `model_provider`. Doing so makes previously recorded
+#     sessions disappear from the session list (they are grouped per provider)
+#     and can hang the desktop client on startup.
+#   * In TOML, top-level keys must appear before the first [table] header.
+
+# ---------------------------------------------------------------------------
+# Optional, top-level key. The switch in [features] below is marked as an
+# under-development feature, which prints a yellow warning on every start.
+# Uncomment to silence it.
+# ---------------------------------------------------------------------------
+# suppress_unstable_features_warning = true
+
+[features]
+# The actual fix: let the Rust backend resolve the Windows system proxy
+# (WinHTTP / PAC) instead of ignoring it. Verified present in the codex-rs
+# features registry, key = "respect_system_proxy", default_enabled = false.
+respect_system_proxy = true
+
+# Shown for context only - it was already present in the reference config.
+# js_repl = false

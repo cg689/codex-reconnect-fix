@@ -1,0 +1,16 @@
+# reports and scratch output produced by the diagnose script
+*.log
+report*.txt
+before.txt
+after.txt
+
+# local test fixtures
+_test/
+_selftest*
+
+# editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp

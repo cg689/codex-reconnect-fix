@@ -1,0 +1,14 @@
+# Keep a single line ending in the repository so scripts, config snippets and
+# docs behave identically on every machine.
+# Windows PowerShell 5.1 and PowerShell 7+ both run LF-only .ps1 files fine.
+* text=auto eol=lf
+
+*.ps1  text eol=lf
+*.md   text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+
+*.png binary
+*.gif binary
+*.jpg binary
+*.zip binary
