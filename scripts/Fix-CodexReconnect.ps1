@@ -37,6 +37,16 @@
 .PARAMETER DryRun
     Print exactly what would change, write nothing.
 
+.PARAMETER Force
+    Override the safety gate if it refuses; the refusal reason is still printed. Use it only
+    when you know the target port is really the one you want - for example you are
+    configuring ahead of time and the proxy client is not running yet.
+
+.PARAMETER SkipProxyCheck
+    Skip only the *remote* chain probe (a request through the proxy to chatgpt.com), for
+    machines that have no internet yet. The local check that something is listening on the
+    port still runs, so a dead port is still refused.
+
 .EXAMPLE
     .\Fix-CodexReconnect.ps1 -DryRun
     .\Fix-CodexReconnect.ps1
@@ -508,63 +518,63 @@ if (-not $SkipSystemProxy) {
 # silently.
 Write-Head 'Safety check  Is the target port usable?'
 
-if ($SkipProxyCheck) {
-    Write-Item 'skipped (-SkipProxyCheck) - no probe was performed'
+# The liveness check reads the local kernel TCP table - it needs no internet, so it always
+# runs. -SkipProxyCheck only skips the *remote* chain probe, never the dead-port refusal.
+$portLive = [bool]$portInfo.Live
+if ($portLive) {
+    Write-Item ("127.0.0.1:{0}  -> accepting TCP connections" -f $proxyPort)
 } else {
-    $portLive = [bool]$portInfo.Live
-    if ($portLive) {
-        Write-Item ("127.0.0.1:{0}  -> accepting TCP connections" -f $proxyPort)
+    Write-Item ("127.0.0.1:{0}  -> NOTHING IS LISTENING" -f $proxyPort)
+}
+
+$chain = $null
+if ($portLive -and -not $SkipProxyCheck) {
+    $chain = Test-ProxyChain -ProxyPort $proxyPort -Timeout $ProxyTestTimeoutSec
+    if ($chain.Ok) {
+        Write-Item ("proxy chain         -> reachable through it ({0})" -f $chain.Detail)
     } else {
-        Write-Item ("127.0.0.1:{0}  -> NOTHING IS LISTENING" -f $proxyPort)
+        Write-Item ("proxy chain         -> FAILED ({0})" -f $chain.Detail)
     }
+} elseif ($portLive) {
+    Write-Item 'proxy chain         -> not tested (-SkipProxyCheck)'
+}
 
-    $chain = $null
-    if ($portLive) {
-        $chain = Test-ProxyChain -ProxyPort $proxyPort -Timeout $ProxyTestTimeoutSec
-        if ($chain.Ok) {
-            Write-Item ("proxy chain         -> reachable through it ({0})" -f $chain.Detail)
-        } else {
-            Write-Item ("proxy chain         -> FAILED ({0})" -f $chain.Detail)
-        }
+$refused = $null
+if (-not $portLive) {
+    $refused = ("Nothing is listening on 127.0.0.1:{0}. " -f $proxyPort)
+    if (-not $SkipSystemProxy) {
+        $refused += 'Pointing the Windows system proxy at a dead port would take this machine offline ' +
+                    '(every HTTPS request would fail).'
+    } else {
+        $refused += 'The proxy would be dead for Codex as well.'
     }
+    if ($portInfo.Source -like 'default*' -or $portInfo.Source -like 'well-known*') {
+        $refused += ("  Port {0} was only a guess - pass -Port <your real proxy port>." -f $proxyPort)
+    } else {
+        $refused += '  Start your proxy client - or its local inbound port changed.'
+    }
+} elseif (-not $SkipSystemProxy -and $chain -and -not $chain.Ok) {
+    $refused = ("127.0.0.1:{0} is listening but traffic through it cannot reach chatgpt.com." -f $proxyPort) +
+               ' Writing it into the system proxy would break normal browsing too. Fix the proxy chain (node / ' +
+               'subscription / outbound) first.'
+}
 
-    $refused = $null
-    if (-not $portLive) {
-        $refused = ("Nothing is listening on 127.0.0.1:{0}. " -f $proxyPort)
-        if (-not $SkipSystemProxy) {
-            $refused += 'Pointing the Windows system proxy at a dead port would take this machine offline ' +
-                        '(every HTTPS request would fail).'
-        } else {
-            $refused += 'The proxy would be dead for Codex as well.'
-        }
-        if ($portInfo.Source -like 'default*' -or $portInfo.Source -like 'well-known*') {
-            $refused += ("  Port {0} was only a guess - pass -Port <your real proxy port>." -f $proxyPort)
-        } else {
-            $refused += '  Start your proxy client - or its local inbound port changed.'
-        }
-    } elseif (-not $SkipSystemProxy -and $chain -and -not $chain.Ok) {
-        $refused = ("127.0.0.1:{0} is listening but traffic through it cannot reach chatgpt.com." -f $proxyPort) +
-                   ' Writing it into the system proxy would break normal browsing too. Fix the proxy chain (node / ' +
-                   'subscription / outbound) first.'
-    }
-
-    if ($refused -and -not $Force) {
-        Write-Host ''
-        Write-Host 'REFUSED - nothing has been written.' -ForegroundColor Red
-        Write-Host ''
-        Write-Host $refused
-        Write-Host ''
-        Write-Host 'Options'
-        Write-Host '  * start your proxy client and run this again'
-        Write-Host ('  * point at the right port            : .\Fix-CodexReconnect.ps1 -Port <n>')
-        Write-Host ('  * leave the system proxy alone       : .\Fix-CodexReconnect.ps1 -SkipSystemProxy -SetEnvironmentVariables')
-        Write-Host ('  * override the check anyway          : .\Fix-CodexReconnect.ps1 -Force')
-        if ($DryRun) { Write-Host ' (dry run - the real run would stop here)' }
-        exit 4
-    }
-    if ($refused -and $Force) {
-        Write-Item 'WARNING: overriding the safety check (-Force)'
-    }
+if ($refused -and -not $Force) {
+    Write-Host ''
+    Write-Host 'REFUSED - nothing has been written.' -ForegroundColor Red
+    Write-Host ''
+    Write-Host $refused
+    Write-Host ''
+    Write-Host 'Options'
+    Write-Host '  * start your proxy client and run this again'
+    Write-Host ('  * point at the right port            : .\Fix-CodexReconnect.ps1 -Port <n>')
+    Write-Host ('  * leave the system proxy alone       : .\Fix-CodexReconnect.ps1 -SkipSystemProxy -SetEnvironmentVariables')
+    Write-Host ('  * override the check anyway          : .\Fix-CodexReconnect.ps1 -Force')
+    if ($DryRun) { Write-Host ' (dry run - the real run would stop here)' }
+    exit 4
+}
+if ($refused -and $Force) {
+    Write-Item 'WARNING: overriding the safety check (-Force)'
 }
 
 # ---- backups -------------------------------------------------------------

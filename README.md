@@ -94,14 +94,21 @@ cd codex-reconnect-fix\scripts
 
 **为什么有那道安全检查**：把 Windows 系统代理指向一个**没人监听的端口**，会让整台机器断网（所有 HTTPS 请求都失败）。所以脚本在写注册表**之前**会先确认端口可用；不通过时它什么都不写，直接退出（退出码 `4`），并告诉你怎么继续。确认自己清楚风险时可以用 `-Force` 跳过。
 
+这道检查分两层，`-SkipProxyCheck` 只会关掉第二层：
+
+| 层 | 查什么 | 需要联网吗 | 能否跳过 |
+| --- | --- | --- | --- |
+| 存活 | 本地有没有进程在监听该端口（读内核 TCP 表） | 否 | **不能**（要跳过请用 `-Force`） |
+| 链路 | 经该代理能不能连通 chatgpt.com | 是 | `-SkipProxyCheck` |
+
 `Fix` 支持的参数：
 
 ```powershell
 .\Fix-CodexReconnect.ps1 -DryRun                    # 只预览
 .\Fix-CodexReconnect.ps1 -Port 7890                 # 指定代理端口
 .\Fix-CodexReconnect.ps1 -SkipSystemProxy -SetEnvironmentVariables   # 只写环境变量，不碰系统代理
-.\Fix-CodexReconnect.ps1 -SkipProxyCheck            # 跳过端口探测（机器还没联网时）
-.\Fix-CodexReconnect.ps1 -Force                     # 跳过安全检查
+.\Fix-CodexReconnect.ps1 -SkipProxyCheck            # 跳过“联网链路”探测（机器还没联网时）；端口存活检查照跑
+.\Fix-CodexReconnect.ps1 -Force                     # 跳过安全检查（含端口存活检查）
 ```
 
 **不做的事**（很重要）：
@@ -264,6 +271,11 @@ Then fully quit and restart the desktop app.
 accepting connections — that would take the whole machine offline. When it refuses, nothing
 has been written and it exits with code `4`. Override with `-Force` only if you know the
 proxy is about to come up.
+
+The gate has two layers. The local liveness check (is anything listening on the port?) reads
+the kernel TCP table and needs no internet, so it always runs. The remote chain check (can
+traffic through the proxy reach chatgpt.com?) needs internet and is what `-SkipProxyCheck`
+turns off. A dead port is refused either way; only `-Force` overrides that.
 
 Deliberately **not** done: replacing `model_provider`. The forum-popular provider swap with
 `supports_websockets = false` works for the CLI but hangs the desktop client on startup.
