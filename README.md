@@ -40,21 +40,42 @@
 
 ### 快速开始
 
+**方式 A —— 双击（不用碰命令行）**
+
+不管你是 `git clone` 还是「Download ZIP」，拿到仓库后直接双击根目录里的文件：
+
+| 双击这个 | 作用 |
+| --- | --- |
+| **`Diagnose.cmd`** | 体检。**只读**，不改任何东西 |
+| **`Fix.cmd`** | 修复。动手前先备份，判断不安全就拒绝执行 |
+| **`Rollback.cmd`** | 一键还原 |
+
+这三个 `.cmd` 会自动处理下面那个「Windows 拦下脚本」的问题，你不需要改任何系统设置。
+
+**方式 B —— 命令行**
+
 ```powershell
 git clone https://github.com/cg689/codex-reconnect-fix.git
 cd codex-reconnect-fix\scripts
 
-# 1. 先体检（只读，不改任何东西）
-.\Diagnose-CodexReconnect.ps1
-
-# 2. 看一眼它打算改什么
-.\Fix-CodexReconnect.ps1 -DryRun
-
-# 3. 动手
-.\Fix-CodexReconnect.ps1
+.\Diagnose-CodexReconnect.ps1        # 1. 先体检（只读，不改任何东西）
+.\Fix-CodexReconnect.ps1 -DryRun     # 2. 看一眼它打算改什么
+.\Fix-CodexReconnect.ps1             # 3. 动手
 
 # 4. 完全退出 Codex / ChatGPT 桌面端（含托盘）再启动，新建对话验证
 ```
+
+> **如果命令行报错说「无法加载文件……未对文件进行数字签名」**：这不是脚本有问题，是 Windows 的默认拦截。两个原因叠在一起 ——
+> ① Windows 默认执行策略是 `Restricted`，**任何 `.ps1` 都不让跑**；
+> ② 「Download ZIP」解出来的文件带 Mark-of-the-Web 标记，即使策略是 `RemoteSigned` 也会被拦。
+>
+> 任选一种解法：改用**方式 A**（`.cmd` 已内置处理）；或者手动绕过：
+>
+> ```powershell
+> powershell -ExecutionPolicy Bypass -File .\Diagnose-CodexReconnect.ps1
+> ```
+>
+> 域环境下若公司用组策略把 `Bypass` 也禁掉了，那只能把脚本内容贴进控制台执行 —— 这是企业策略，脚本无能为力。
 
 无需管理员权限（只写 `HKCU`）。所有改动前自动备份，一条命令回滚：
 
@@ -66,9 +87,22 @@ cd codex-reconnect-fix\scripts
 
 | 步骤 | 动作 | 位置 |
 | --- | --- | --- |
+| 安全检查 | 确认目标端口真的在监听、且经它能连通 chatgpt.com。**不通过就拒绝执行** | — |
 | 备份 | 复制 `config.toml`，并把当前系统代理值写进 `state.json` | `<CodexHome>\reconnect-fix-backups\<时间戳>\` |
 | 修复 1 | `ProxyEnable=1`、`ProxyServer=127.0.0.1:<端口>` | `HKCU\...\Internet Settings` |
 | 修复 2 | 在 `[features]` 下写入 `respect_system_proxy = true` | `<CodexHome>\config.toml` |
+
+**为什么有那道安全检查**：把 Windows 系统代理指向一个**没人监听的端口**，会让整台机器断网（所有 HTTPS 请求都失败）。所以脚本在写注册表**之前**会先确认端口可用；不通过时它什么都不写，直接退出（退出码 `4`），并告诉你怎么继续。确认自己清楚风险时可以用 `-Force` 跳过。
+
+`Fix` 支持的参数：
+
+```powershell
+.\Fix-CodexReconnect.ps1 -DryRun                    # 只预览
+.\Fix-CodexReconnect.ps1 -Port 7890                 # 指定代理端口
+.\Fix-CodexReconnect.ps1 -SkipSystemProxy -SetEnvironmentVariables   # 只写环境变量，不碰系统代理
+.\Fix-CodexReconnect.ps1 -SkipProxyCheck            # 跳过端口探测（机器还没联网时）
+.\Fix-CodexReconnect.ps1 -Force                     # 跳过安全检查
+```
 
 **不做的事**（很重要）：
 
@@ -98,7 +132,22 @@ cd codex-reconnect-fix\scripts
 -------------------------------------------------------------
 ```
 
-退出码：`0` 正常、`1` 发现问题、`2` 找不到 CodexHome。适合接到你自己的巡检脚本里。加 `-ReportPath report.txt` 可把纯文本报告存盘，方便贴 issue。
+退出码：`Diagnose` 用 `0` 正常 / `1` 发现问题 / `2` 找不到 CodexHome；`Fix` 用 `0` 完成 / `1` 配置缺失 / `3` 写入失败 / `4` 被安全检查拒绝。适合接到你自己的巡检脚本里。加 `-ReportPath report.txt` 可把纯文本报告存盘，方便贴 issue。
+
+### 端口是怎么自动识别的
+
+不传 `-Port` 时，脚本按下面的顺序收集线索，然后**取第一个真的在监听的**（没人监听的端口只会让情况更糟）：
+
+| 顺序 | 来源 |
+| --- | --- |
+| 1 | `-Port` 指定的 |
+| 2 | 当前 Windows 系统代理设置里已写的端口 |
+| 3 | 本机代理客户端配置文件里的入站端口（v2rayN / Clash / mihomo / sing-box / Xray） |
+| 4 | 常见代理端口里正在监听的那个（Clash 7890/7897、v2rayN 10808、sing-box 2080…） |
+| 5 | 上面都没命中时，退回一个**猜测值**并在报告里标明这是猜的 |
+| 6 | 兜底 `10808` |
+
+报告里会打印每个候选端口的**来源**和**是否在监听**，所以「端口猜错了」不会被误报成「代理挂了」。想换一个试：`-Port <n>`。
 
 ### 为什么代理开了还是不行
 
@@ -130,9 +179,12 @@ cd codex-reconnect-fix\scripts
 
 ```
 codex-reconnect-fix/
+├── Diagnose.cmd                       # 双击体检（自动处理执行策略与下载标记）
+├── Fix.cmd                            # 双击修复
+├── Rollback.cmd                       # 双击回滚
 ├── scripts/
 │   ├── Diagnose-CodexReconnect.ps1    # 体检（只读）
-│   ├── Fix-CodexReconnect.ps1         # 修复（备份 + 两步改动）
+│   ├── Fix-CodexReconnect.ps1         # 修复（安全检查 + 备份 + 两步改动）
 │   └── Rollback-CodexReconnect.ps1    # 回滚
 ├── config/
 │   └── config.example.toml            # 最小可用配置片段
@@ -147,6 +199,7 @@ codex-reconnect-fix/
 - Windows 10 / 11，Windows PowerShell 5.1 或 PowerShell 7+
 - 验证版本：`codex-cli 0.153.x`（商店包 `OpenAI.Codex`），2026-09
 - 其他代理客户端同理：只要它提供本地 HTTP 入站端口，`-Port` 指过去即可
+- 三个 `.ps1` 全部是纯 ASCII、无 BOM —— PowerShell 5.1 在没有 BOM 时按 ANSI 解码文件，脚本里一旦出现非 ASCII 字符就会乱码甚至解析失败，这点是刻意规避的
 
 ### 已知遗留
 
@@ -176,6 +229,21 @@ Two options, both handled by the scripts:
    `RespectSystemProxy`). Cleanest path, one line.
 2. **Or set proxy environment variables** — `.\Fix-CodexReconnect.ps1 -SetEnvironmentVariables`.
 
+**Easiest way in:** double-click the launchers in the repository root. No PowerShell
+knowledge required.
+
+| Double-click | What it does |
+| --- | --- |
+| `Diagnose.cmd` | Read-only health check. Changes nothing. |
+| `Fix.cmd` | Applies the fix. Backs up first, refuses unsafe changes. |
+| `Rollback.cmd` | Undoes everything. |
+
+These wrappers exist because Windows blocks `.ps1` files out of the box (execution policy
+`Restricted`) and additionally refuses files that came out of a downloaded ZIP. They handle
+both, so you do not have to touch your system settings.
+
+Or from a PowerShell window:
+
 ```powershell
 cd scripts
 .\Diagnose-CodexReconnect.ps1        # read-only health check, exits 1 when the cause is found
@@ -184,12 +252,26 @@ cd scripts
 .\Rollback-CodexReconnect.ps1        # undo
 ```
 
+If the bare `.ps1` call is blocked, prefix it:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Diagnose-CodexReconnect.ps1
+```
+
 Then fully quit and restart the desktop app.
+
+**Safety gate.** `Fix` refuses to point the Windows system proxy at a port that is not
+accepting connections — that would take the whole machine offline. When it refuses, nothing
+has been written and it exits with code `4`. Override with `-Force` only if you know the
+proxy is about to come up.
 
 Deliberately **not** done: replacing `model_provider`. The forum-popular provider swap with
 `supports_websockets = false` works for the CLI but hangs the desktop client on startup.
 
 Requirements: Windows 10/11, PowerShell 5.1 or 7+, no admin rights (writes only to `HKCU`).
+The three `.ps1` files are pure ASCII and carry no BOM on purpose: without a BOM,
+PowerShell 5.1 decodes a script using the ANSI code page, so any non-ASCII character would
+turn into garbage or break parsing.
 
 Companion project for the "something keeps stealing my system proxy" case:
 [v2rayn-proxy-guard](https://github.com/cg689/v2rayn-proxy-guard).

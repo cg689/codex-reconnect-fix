@@ -8,6 +8,13 @@
 *.toml text eol=lf
 *.json text eol=lf
 
+# Batch files are stored byte-for-byte with CRLF endings (-text = no conversion).
+# cmd.exe is unreliable with LF-only .cmd/.bat files, and normalising through the
+# index means the archive/checkout result depends on host settings - so the bytes
+# committed here are exactly the bytes Windows will run.
+*.cmd  -text
+*.bat  -text
+
 *.png binary
 *.gif binary
 *.jpg binary

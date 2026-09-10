@@ -44,7 +44,10 @@
 
 .NOTES
     Windows PowerShell 5.1 and PowerShell 7+. No admin rights required.
-    Exit code: 0 = fixed (or dry-run completed), 1 = CodexHome / config.toml missing, 3 = write failed.
+    Exit code: 0 = fixed (or dry-run completed)
+               1 = CodexHome / config.toml missing
+               3 = write failed
+               4 = refused by the proxy safety gate (nothing was written)
     Author: cg689  |  https://github.com/cg689/codex-reconnect-fix
 #>
 
@@ -54,7 +57,10 @@ param(
     [string]$CodexHome = (Join-Path $env:USERPROFILE '.codex'),
     [switch]$SetEnvironmentVariables,
     [switch]$SkipSystemProxy,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Force,
+    [switch]$SkipProxyCheck,
+    [int]$ProxyTestTimeoutSec = 10
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,6 +72,14 @@ $Stamp       = Get-Date -Format 'yyyyMMdd-HHmmss'
 $Utf8NoBom   = New-Object System.Text.UTF8Encoding($false)
 
 $script:Changes = New-Object System.Collections.Generic.List[string]
+
+# caches for the proxy-port discovery (see Get-CandidateClientDirs and friends)
+$script:ClientDirsProbed  = $false
+$script:ClientDirs        = @()
+$script:ConfigPortsProbed = $false
+$script:ConfigPorts       = @()
+$script:ListeningProbed   = $false
+$script:ListeningPorts    = @()
 
 function Write-Head {
     param([string]$Text)
@@ -79,70 +93,291 @@ function Write-Item {
 }
 
 # ---------------------------------------------------------------------------
-# port detection (same source order as the sibling v2rayn-proxy-guard project)
+# proxy port resolution
+#
+# Evidence is collected from several sources, then the first entry that is
+# actually LISTENING wins - a port nothing is listening on can only make
+# matters worse, so a dead candidate is never preferred over a live one:
+#
+#   1. -Port
+#   2. the port already written in the Windows system proxy setting
+#   3. the inbound port found in an installed proxy client's config file
+#      (v2rayN / Clash / mihomo / sing-box / Xray layouts)
+#   4. any well-known proxy port that is currently listening
+#   5. a dead candidate, so that the user is told which port was guessed
+#   6. 10808
 # ---------------------------------------------------------------------------
 
-function Find-V2rayNDir {
-    $proc = Get-Process v2rayN -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path } | Select-Object -First 1
-    if ($proc) { return Split-Path $proc.Path -Parent }
+$script:CommonProxyPorts = @(
+    7890,   # Clash / Clash for Windows / old Clash Verge
+    7897,   # Clash Verge Rev / mihomo
+    7891,   # secondary mixed port in some Clash setups
+    10808,  # v2rayN
+    10809,  # v2rayN / Xray
+    1080,   # generic SOCKS/HTTP
+    2080,   # sing-box default mixed port
+    2081,   # sing-box secondary
+    8889,   # common in CN client packs
+    20171,  # common in CN client packs
+    33210,  # common in CN client packs
+    8118    # Privoxy
+)
 
-    if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
-        $task = Get-ScheduledTask -ErrorAction SilentlyContinue |
-                Where-Object { $_.TaskName -like 'v2rayNAutoRun_*' } | Select-Object -First 1
-        if ($task -and $task.Actions.Count -gt 0) {
-            $exe = $task.Actions[0].Execute.Trim('"')
-            if (Test-Path $exe) { return Split-Path $exe -Parent }
+function Test-TcpPort {
+    param([int]$TargetPort, [int]$TimeoutMs = 600)
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect('127.0.0.1', $TargetPort, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) { return $false }
+        $client.EndConnect($iar)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        $client.Close()
+    }
+}
+
+function Test-ProxyChain {
+    <#
+        Does 127.0.0.1:<Port> actually behave as an HTTP proxy that can reach
+        chatgpt.com? Any HTTP response counts as success - a 401/403 just means the
+        tunnel was built. Only a transport failure (or a timeout) is a failure.
+    #>
+    param([int]$ProxyPort, [int]$Timeout)
+    Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+
+    $handler = New-Object System.Net.Http.HttpClientHandler
+    $handler.UseProxy = $true
+    $handler.Proxy = New-Object System.Net.WebProxy(("http://127.0.0.1:{0}" -f $ProxyPort), $true)
+    $handler.AllowAutoRedirect = $false
+
+    $client = New-Object System.Net.Http.HttpClient($handler)
+    $client.Timeout = [System.TimeSpan]::FromSeconds($Timeout)
+
+    $req = New-Object -TypeName System.Net.Http.HttpRequestMessage -ArgumentList @(
+        [System.Net.Http.HttpMethod]::Get, 'https://chatgpt.com/')
+    try {
+        $resp = $client.SendAsync($req).GetAwaiter().GetResult()
+        return [pscustomobject]@{ Ok = $true; Detail = ('HTTP {0}' -f [int]$resp.StatusCode) }
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Detail = $_.Exception.Message }
+    } finally {
+        if ($client)  { $client.Dispose() }
+        if ($handler) { $handler.Dispose() }
+    }
+}
+
+function Get-CandidateClientDirs {
+    <#
+        Directories of proxy clients that might be installed. Deliberately generic -
+        no machine-specific paths. Cached - several helpers need the same list, and
+        enumerating scheduled tasks / uninstall keys is not free.
+    #>
+    if ($script:ClientDirsProbed) { return $script:ClientDirs }
+
+    $dirs = New-Object System.Collections.Generic.List[string]
+
+    foreach ($name in @('v2rayN', 'clash', 'clash-verge', 'clash-verge-rev', 'verge-mihomo', 'mihomo', 'sing-box', 'Xray', 'nekobox')) {
+        $proc = Get-Process -Name $name -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path } | Select-Object -First 1
+        if ($proc) { $dirs.Add((Split-Path $proc.Path -Parent)) }
+    }
+
+    # uninstall registry entries (replaces any hard-coded install path)
+    foreach ($root in @(
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )) {
+        foreach ($item in (Get-ItemProperty -Path $root -ErrorAction SilentlyContinue)) {
+            if ($item.DisplayName -and $item.DisplayName -match 'v2ray|clash|sing-box|mihomo|Xray|nekoray|nekobox') {
+                if ($item.InstallLocation -and (Test-Path $item.InstallLocation)) { $dirs.Add($item.InstallLocation) }
+            }
         }
     }
 
-    foreach ($dir in @(
+    foreach ($guess in @(
         "$env:ProgramFiles\v2rayN",
         "${env:ProgramFiles(x86)}\v2rayN",
         "$env:LOCALAPPDATA\Programs\v2rayN",
-        "$env:USERPROFILE\Desktop\v2rayN",
-        "D:\Software\v2rayN-windows-64-desktop\v2rayN-windows-64",
-        "D:\v2rayN", "C:\v2rayN"
+        "$env:LOCALAPPDATA\Programs\clash-verge",
+        "$env:APPDATA\io.github.clash-verge-rev.clash-verge-rev"
     )) {
-        if (Test-Path (Join-Path $dir 'v2rayN.exe')) { return $dir }
+        if (Test-Path $guess) { $dirs.Add($guess) }
     }
-    return $null
+
+    if ($dirs.Count -eq 0 -and (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+        # Last resort, and only when nothing cheaper found anything: reading the
+        # scheduled-task store costs about two seconds on a typical machine.
+        foreach ($task in (Get-ScheduledTask -TaskName 'v2rayNAutoRun_*' -ErrorAction SilentlyContinue)) {
+            if ($task.Actions.Count -gt 0) {
+                $exe = $task.Actions[0].Execute.Trim('"')
+                if ($exe -and (Test-Path $exe)) { $dirs.Add((Split-Path $exe -Parent)) }
+            }
+        }
+    }
+
+    $script:ClientDirs = @($dirs | Where-Object { $_ } | Select-Object -Unique)
+    $script:ClientDirsProbed = $true
+    return $script:ClientDirs
+}
+
+function Get-ConfigFilePorts {
+    <#
+        Inbound ports advertised by locally installed proxy clients. Heuristic on
+        purpose: patterns are matched by regex so JSON and YAML layouts both work.
+        Cached - the caller may resolve the port more than once per run.
+    #>
+    if ($script:ConfigPortsProbed) { return $script:ConfigPorts }
+
+    $hits  = New-Object System.Collections.Generic.List[object]
+    $files = New-Object System.Collections.Generic.List[string]
+
+    foreach ($dir in (Get-CandidateClientDirs)) {
+        foreach ($rel in @('guiConfigs\guiNConfig.json', 'binConfigs\config.json', 'config.json', 'config.yaml')) {
+            $p = Join-Path $dir $rel
+            if (Test-Path $p) { $files.Add($p) }
+        }
+    }
+
+    foreach ($root in @(
+        "$env:APPDATA\io.github.clash-verge-rev.clash-verge-rev",
+        "$env:APPDATA\clash-verge",
+        "$env:APPDATA\sing-box",
+        "$env:USERPROFILE\.config\clash",
+        "$env:USERPROFILE\.config\mihomo",
+        "$env:USERPROFILE\.config\sing-box"
+    )) {
+        if (Test-Path $root) {
+            # note: a plain foreach - List[string].AddRange() rejects an Object[] in PS 5.1
+            $found = Get-ChildItem -Path $root -Recurse -Depth 3 -File -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Extension -in @('.json', '.yaml', '.yml') } |
+                     Select-Object -First 20
+            foreach ($f in $found) { $files.Add($f.FullName) }
+        }
+    }
+
+    # YAML: only top-level (column 0) keys count. Subscriptions and generated configs
+    # carry a `port:` inside every proxy node, and those are not inbound ports.
+    # JSON: v2rayN / sing-box nest the inbound port, so indentation is allowed there.
+    $yamlPattern = '(?im)^["'']?(mixed-port|mixed_port|listen_port|listen-port|http_port|http-port|socks-port|socks_port|localPort|port)["'']?\s*:\s*["'']?(\d{2,5})'
+    $jsonPattern = '(?im)^\s*["'']?(mixed_port|listen_port|http_port|socks_port|localPort|local_port|port)["'']?\s*[:=]\s*["'']?(\d{2,5})'
+
+    foreach ($file in ($files | Select-Object -Unique)) {
+        # skip schema / example / verification artefacts that Clash Verge drops next to
+        # the real config - they are full of unrelated port numbers
+        if ((Split-Path $file -Leaf) -match '(?i)check|example|template|sample|schema|readme') { continue }
+
+        $text = $null
+        try { $text = Get-Content -Path $file -Raw -Encoding UTF8 -ErrorAction Stop } catch { continue }
+        if (-not $text) { continue }
+
+        $pattern = if ($file -match '\.ya?ml$') { $yamlPattern } else { $jsonPattern }
+        foreach ($m in [regex]::Matches($text, $pattern)) {
+            $port = [int]$m.Groups[2].Value
+            if ($hits | Where-Object { $_.Port -eq $port }) { continue }
+            $hits.Add([pscustomobject]@{
+                Port   = $port
+                Source = ('config file {0} ({1})' -f (Split-Path $file -Leaf), $m.Groups[1].Value)
+            })
+        }
+        if ($hits.Count -ge 3) { break }
+    }
+
+    $script:ConfigPorts = $hits
+    $script:ConfigPortsProbed = $true
+    return $script:ConfigPorts
+}
+
+function Get-ListeningPorts {
+    <#
+        Which well-known proxy ports are listening right now.
+
+        Reading the kernel's TCP listen table through .NET is a few milliseconds;
+        probing ports one by one (a connect attempt each) costs ~0.4 s per port because
+        a refused loopback connect still burns the full timeout on Windows. Probing is
+        kept only as a fallback.
+    #>
+    if ($script:ListeningProbed) { return $script:ListeningPorts }
+
+    $live = New-Object System.Collections.Generic.List[int]
+    $fromTable = $false
+
+    try {
+        $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+        $openPorts = @{}
+        foreach ($ep in $listeners) { $openPorts[[int]$ep.Port] = $true }
+        foreach ($p in $script:CommonProxyPorts) {
+            if ($openPorts.ContainsKey($p)) { $live.Add($p) }
+        }
+        $fromTable = $true
+    } catch {
+        $fromTable = $false
+    }
+
+    if (-not $fromTable) {
+        foreach ($p in $script:CommonProxyPorts) {
+            if (Test-TcpPort -TargetPort $p -TimeoutMs 150) { $live.Add($p) }
+        }
+    }
+
+    $script:ListeningPorts = $live
+    $script:ListeningProbed = $true
+    return $script:ListeningPorts
 }
 
 function Resolve-ProxyPort {
     param([string]$CurrentProxyServer)
-    if ($Port -gt 0) { return @{ Port = $Port; Source = 'forced by -Port' } }
+
+    if ($Port -gt 0) {
+        $live = Test-TcpPort -TargetPort $Port
+        return [pscustomobject]@{
+            Port       = $Port
+            Source     = 'forced by -Port'
+            Live       = $live
+            Candidates = @([pscustomobject]@{ Port = $Port; Source = 'forced by -Port'; Live = $live })
+        }
+    }
+
+    # collect: system proxy setting, client config files, live well-known ports
+    $raw = New-Object System.Collections.Generic.List[object]
 
     if ($CurrentProxyServer -match ':(?<p>\d{2,5})\s*$') {
-        return @{ Port = [int]$Matches['p']; Source = 'from the current system proxy setting' }
+        $raw.Add([pscustomobject]@{ Port = [int]$Matches['p']; Source = 'from the Windows system proxy setting' })
+    }
+    foreach ($h in (Get-ConfigFilePorts)) {
+        $raw.Add([pscustomobject]@{ Port = [int]$h.Port; Source = $h.Source })
+    }
+    $listening = @(Get-ListeningPorts)
+    foreach ($p in $listening) {
+        $raw.Add([pscustomobject]@{ Port = $p; Source = 'well-known proxy port, currently listening' })
+    }
+    if ($raw.Count -eq 0) {
+        $raw.Add([pscustomobject]@{ Port = 10808; Source = 'default (nothing detected)' })
     }
 
-    $dir = Find-V2rayNDir
-    if ($dir) {
-        $guiFile = Join-Path $dir 'guiConfigs\guiNConfig.json'
-        if (Test-Path $guiFile) {
-            try {
-                $gui = Get-Content $guiFile -Raw -Encoding UTF8 | ConvertFrom-Json
-                if ($gui.Inbound -and $gui.Inbound.Count -gt 0) {
-                    return @{ Port = [int]$gui.Inbound[0].LocalPort; Source = "from v2rayN at $dir" }
-                }
-            } catch { }
-        }
-        $coreFile = Join-Path $dir 'binConfigs\config.json'
-        if (Test-Path $coreFile) {
-            try {
-                $core = Get-Content $coreFile -Raw -Encoding UTF8 | ConvertFrom-Json
-                foreach ($in in $core.inbounds) {
-                    $type = if ($in.type) { $in.type } else { $in.protocol }
-                    if ($type -in @('mixed', 'socks', 'http')) {
-                        if ($in.listen_port) { return @{ Port = [int]$in.listen_port; Source = "from core config at $dir" } }
-                        if ($in.port)        { return @{ Port = [int]$in.port;        Source = "from core config at $dir" } }
-                    }
-                }
-            } catch { }
-        }
+    # deduplicate; shortlist membership comes from the listen table (cheap)
+    $candidates = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($c in $raw) {
+        $n = [int]$c.Port
+        if ($seen.ContainsKey($n)) { continue }
+        $seen[$n] = $true
+        $candidates.Add([pscustomobject]@{
+            Port = $n; Source = $c.Source; Live = [bool]($listening -contains $n) })
     }
-    return @{ Port = 10808; Source = 'default (nothing detected)' }
+
+    $picked = $candidates | Where-Object { $_.Live } | Select-Object -First 1
+    if (-not $picked) { $picked = $candidates | Select-Object -First 1 }
+
+    # one authoritative connect on the port we are about to write into the system proxy
+    return [pscustomobject]@{
+        Port       = [int]$picked.Port
+        Source     = $picked.Source
+        Live       = (Test-TcpPort -TargetPort ([int]$picked.Port))
+        Candidates = $candidates
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -247,6 +482,90 @@ Write-Item ("Codex home         : {0}" -f $CodexHome)
 Write-Item ("Proxy port         : {0}  ({1})" -f $proxyPort, $portInfo.Source)
 Write-Item ("System proxy       : enable={0} server='{1}'" -f $currentEnable, $currentServer)
 Write-Item ("Target system proxy: {0}" -f $target)
+
+if (-not $SkipSystemProxy) {
+    # listening ports first, then the rest - and never more than 6 rows of noise
+    $others = @($portInfo.Candidates | Where-Object { [int]$_.Port -ne $proxyPort })
+    $shown  = @($others | Where-Object { $_.Live } | Select-Object -First 3) +
+              @($others | Where-Object { -not $_.Live } | Select-Object -First 3)
+    if ($shown.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'Other local proxy ports seen on this machine'
+        foreach ($c in $shown) {
+            Write-Item ("{0,-6} {1}   [{2}]" -f $c.Port, $c.Source,
+                        $(if ($c.Live) { 'listening' } else { 'closed' }))
+        }
+        if ($others.Count -gt $shown.Count) {
+            Write-Item ("... {0} more (not listed)" -f ($others.Count - $shown.Count))
+        }
+        Write-Item 'pass -Port <n> to use one of these instead'
+    }
+}
+
+# ---- safety gate ---------------------------------------------------------
+# Pointing the Windows system proxy at a port that is dead - or that is alive but
+# cannot reach the outside world - takes the whole machine offline. Never do that
+# silently.
+Write-Head 'Safety check  Is the target port usable?'
+
+if ($SkipProxyCheck) {
+    Write-Item 'skipped (-SkipProxyCheck) - no probe was performed'
+} else {
+    $portLive = [bool]$portInfo.Live
+    if ($portLive) {
+        Write-Item ("127.0.0.1:{0}  -> accepting TCP connections" -f $proxyPort)
+    } else {
+        Write-Item ("127.0.0.1:{0}  -> NOTHING IS LISTENING" -f $proxyPort)
+    }
+
+    $chain = $null
+    if ($portLive) {
+        $chain = Test-ProxyChain -ProxyPort $proxyPort -Timeout $ProxyTestTimeoutSec
+        if ($chain.Ok) {
+            Write-Item ("proxy chain         -> reachable through it ({0})" -f $chain.Detail)
+        } else {
+            Write-Item ("proxy chain         -> FAILED ({0})" -f $chain.Detail)
+        }
+    }
+
+    $refused = $null
+    if (-not $portLive) {
+        $refused = ("Nothing is listening on 127.0.0.1:{0}. " -f $proxyPort)
+        if (-not $SkipSystemProxy) {
+            $refused += 'Pointing the Windows system proxy at a dead port would take this machine offline ' +
+                        '(every HTTPS request would fail).'
+        } else {
+            $refused += 'The proxy would be dead for Codex as well.'
+        }
+        if ($portInfo.Source -like 'default*' -or $portInfo.Source -like 'well-known*') {
+            $refused += ("  Port {0} was only a guess - pass -Port <your real proxy port>." -f $proxyPort)
+        } else {
+            $refused += '  Start your proxy client - or its local inbound port changed.'
+        }
+    } elseif (-not $SkipSystemProxy -and $chain -and -not $chain.Ok) {
+        $refused = ("127.0.0.1:{0} is listening but traffic through it cannot reach chatgpt.com." -f $proxyPort) +
+                   ' Writing it into the system proxy would break normal browsing too. Fix the proxy chain (node / ' +
+                   'subscription / outbound) first.'
+    }
+
+    if ($refused -and -not $Force) {
+        Write-Host ''
+        Write-Host 'REFUSED - nothing has been written.' -ForegroundColor Red
+        Write-Host ''
+        Write-Host $refused
+        Write-Host ''
+        Write-Host 'Options'
+        Write-Host '  * start your proxy client and run this again'
+        Write-Host ('  * point at the right port            : .\Fix-CodexReconnect.ps1 -Port <n>')
+        Write-Host ('  * leave the system proxy alone       : .\Fix-CodexReconnect.ps1 -SkipSystemProxy -SetEnvironmentVariables')
+        Write-Host ('  * override the check anyway          : .\Fix-CodexReconnect.ps1 -Force')
+        if ($DryRun) { Write-Host ' (dry run - the real run would stop here)' }
+        exit 4
+    }
+    if ($refused -and $Force) {
+        Write-Item 'WARNING: overriding the safety check (-Force)'
+    }
+}
 
 # ---- backups -------------------------------------------------------------
 $backupDir = $null
