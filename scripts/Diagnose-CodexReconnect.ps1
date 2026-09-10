@@ -365,15 +365,36 @@ function Get-ConfigFilePorts {
 
 function Get-ListeningPorts {
     <#
-        One sweep over the well-known proxy ports. A closed port on loopback is
-        refused instantly, so this is cheap even when nothing is running.
+        Which well-known proxy ports are listening right now.
+
+        Reading the kernel's TCP listen table through .NET takes a few milliseconds;
+        probing ports one by one (a connect attempt each) costs ~0.4 s per port because
+        a refused loopback connect still burns the full timeout on Windows. Probing is
+        kept only as a fallback.
     #>
     if ($script:ListeningProbed) { return $script:ListeningPorts }
 
     $live = New-Object System.Collections.Generic.List[int]
-    foreach ($p in $script:CommonProxyPorts) {
-        if (Test-TcpPort -TargetHost '127.0.0.1' -TargetPort $p -TimeoutMs 400) { $live.Add($p) }
+    $fromTable = $false
+
+    try {
+        $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+        $openPorts = @{}
+        foreach ($ep in $listeners) { $openPorts[[int]$ep.Port] = $true }
+        foreach ($p in $script:CommonProxyPorts) {
+            if ($openPorts.ContainsKey($p)) { $live.Add($p) }
+        }
+        $fromTable = $true
+    } catch {
+        $fromTable = $false
     }
+
+    if (-not $fromTable) {
+        foreach ($p in $script:CommonProxyPorts) {
+            if (Test-TcpPort -TargetHost '127.0.0.1' -TargetPort $p -TimeoutMs 150) { $live.Add($p) }
+        }
+    }
+
     $script:ListeningPorts = $live
     $script:ListeningProbed = $true
     return $script:ListeningPorts
@@ -444,7 +465,8 @@ if ($Port -gt 0) {
         Port          = $Port
         Source        = 'forced by -Port'
         Live          = (Test-TcpPort -TargetHost '127.0.0.1' -TargetPort $Port -TimeoutMs 600)
-        Authoritative = $true
+        Authoritative = $false   # -Port is the user's own claim, not the system setting
+        Forced        = $true
         Candidates    = @([pscustomobject]@{ Port = $Port; Source = 'forced by -Port'; Live = $null })
     }
 } else {
@@ -506,8 +528,13 @@ if (-not $proxyState.Readable) {
         Out-Row -Label 'ProxyServer' -Value $proxyState.ProxyServer -State 'ok'
     } else {
         Out-Row -Label 'ProxyServer' -Value ("{0}   (expected {1})" -f $proxyState.ProxyServer, $expected) -State 'warn'
-        $portHint = ("System proxy points at '{0}' but the detected proxy port is {1}. " -f $proxyState.ProxyServer, $portValue) +
-                    'If that port belongs to another proxy client that is running, this is fine.'
+        if ($portInfo.Forced) {
+            $portHint = ("The Windows system proxy points at '{0}', but you passed -Port {1}. " -f $proxyState.ProxyServer, $portValue) +
+                        'Codex follows the system proxy setting, so -Port only changes this check, not the real behaviour.'
+        } else {
+            $portHint = ("System proxy points at '{0}' but the detected proxy port is {1}. " -f $proxyState.ProxyServer, $portValue) +
+                        'If that port belongs to another proxy client that is running, this is fine.'
+        }
         Add-Finding 'warn' $portHint
     }
 
@@ -577,6 +604,9 @@ if (-not $SkipNetworkTest) {
         if ($portInfo.Authoritative) {
             Add-Finding 'fail' ("Nothing answers on 127.0.0.1:{0}, which is the port your Windows system proxy is set to. " -f $portValue) +
                                 'Start the proxy client - without a live local proxy port nothing can be fixed by configuration alone.'
+        } elseif ($portInfo.Forced) {
+            Add-Finding 'fail' ("Nothing answers on 127.0.0.1:{0}, the port you passed with -Port. " -f $portValue) +
+                                'Either the proxy client is not running, or that is not its inbound port.'
         } else {
             $hint = ("Nothing answers on 127.0.0.1:{0}, and {0} was only a guess: no proxy client was detected and the " -f $portValue) +
                     'Windows system proxy does not name a port. Your real local port is probably different.'
