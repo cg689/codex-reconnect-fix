@@ -92,6 +92,10 @@ cd codex-reconnect-fix\scripts
 | 修复 1 | `ProxyEnable=1`、`ProxyServer=127.0.0.1:<端口>` | `HKCU\...\Internet Settings` |
 | 修复 2 | 在 `[features]` 下写入 `respect_system_proxy = true` | `<CodexHome>\config.toml` |
 
+脚本优先使用显式 `-CodexHome`，其次读取 `CODEX_HOME`，最后才使用 `%USERPROFILE%\.codex`。每次真实改动创建唯一备份；若后续写入失败，会按相反顺序恢复本次已完成的改动，并明确列出任何未能恢复的表面。
+
+为避免破坏公司网络，PAC/WPAD、按协议拆分的 `ProxyServer` 或其他复杂路由不会被静默覆盖；需要人工确认时脚本返回拒绝/未验证，而不是猜测。`Diagnose -SkipNetworkTest` 也不会输出健康结论，含用户名密码的代理 URL 会在屏幕和报告中脱敏。
+
 **为什么有那道安全检查**：把 Windows 系统代理指向一个**没人监听的端口**，会让整台机器断网（所有 HTTPS 请求都失败）。所以脚本在写注册表**之前**会先确认端口可用；不通过时它什么都不写，直接退出（退出码 `4`），并告诉你怎么继续。确认自己清楚风险时可以用 `-Force` 跳过。
 
 这道检查分两层，`-SkipProxyCheck` 只会关掉第二层：

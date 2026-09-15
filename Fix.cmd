@@ -31,7 +31,7 @@ echo ============================================================
 echo  Codex Reconnect - FIX   (backs up first, refuses unsafe changes)
 echo ============================================================
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath '%HERE%scripts' -Filter *.ps1 -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Unblock-File -LiteralPath '%TARGET%' -ErrorAction SilentlyContinue" >nul 2>&1
 powershell -NoProfile -ExecutionPolicy Bypass -File "%TARGET%" %*
 set "RC=%ERRORLEVEL%"
 echo.

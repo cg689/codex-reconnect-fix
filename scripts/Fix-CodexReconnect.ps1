@@ -64,7 +64,7 @@
 [CmdletBinding()]
 param(
     [int]$Port = 0,
-    [string]$CodexHome = (Join-Path $env:USERPROFILE '.codex'),
+    [string]$CodexHome,
     [switch]$SetEnvironmentVariables,
     [switch]$SkipSystemProxy,
     [switch]$DryRun,
@@ -75,10 +75,20 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'CodexReconnect.Common.ps1')
+
+try {
+    Assert-CodexReconnectParameters -Port $Port -TimeoutSec $ProxyTestTimeoutSec -TimeoutName 'ProxyTestTimeoutSec'
+    $CodexHome = Resolve-CodexReconnectHome -RequestedHome $CodexHome
+} catch {
+    Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    exit 1
+}
+
 $RegPath     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 $ConfigPath  = Join-Path $CodexHome 'config.toml'
 $BackupRoot  = Join-Path $CodexHome 'reconnect-fix-backups'
-$Stamp       = Get-Date -Format 'yyyyMMdd-HHmmss'
+$Stamp       = '{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss-fff'), ([guid]::NewGuid().ToString('N').Substring(0, 8))
 $Utf8NoBom   = New-Object System.Text.UTF8Encoding($false)
 
 $script:Changes = New-Object System.Collections.Generic.List[string]
@@ -367,7 +377,8 @@ function Resolve-ProxyPort {
         $raw.Add([pscustomobject]@{ Port = 10808; Source = 'default (nothing detected)' })
     }
 
-    # deduplicate; shortlist membership comes from the listen table (cheap)
+    # Deduplicate and probe every candidate, including ports discovered from client
+    # configuration that are not part of the small well-known-port shortlist.
     $candidates = New-Object System.Collections.Generic.List[object]
     $seen = @{}
     foreach ($c in $raw) {
@@ -375,7 +386,7 @@ function Resolve-ProxyPort {
         if ($seen.ContainsKey($n)) { continue }
         $seen[$n] = $true
         $candidates.Add([pscustomobject]@{
-            Port = $n; Source = $c.Source; Live = [bool]($listening -contains $n) })
+            Port = $n; Source = $c.Source; Live = (Test-TcpPort -TargetPort $n -TimeoutMs 600) })
     }
 
     $picked = $candidates | Where-Object { $_.Live } | Select-Object -First 1
@@ -403,56 +414,10 @@ function Set-RespectSystemProxyFeature {
     #>
     param([string]$Path)
 
-    $raw   = [System.IO.File]::ReadAllText($Path)
-    $eol   = if ($raw -match "`r`n") { "`r`n" } else { "`n" }
-    $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($l in ($raw -split "\r?\n")) { $lines.Add($l) }
-
-    # drop the single trailing element produced by a final newline
-    $hadTrailingNewline = $raw -match "(\r?\n)$"
-    if ($hadTrailingNewline -and $lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') {
-        $lines.RemoveAt($lines.Count - 1)
-    }
-
-    $featureIdx = -1
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i].Trim() -eq '[features]') { $featureIdx = $i; break }
-    }
-
-    $result = ''
-
-    if ($featureIdx -lt 0) {
-        $lines.Add('')
-        $lines.Add('[features]')
-        $lines.Add('respect_system_proxy = true')
-        $result = 'appended a new [features] table with respect_system_proxy = true'
-    } else {
-        $end = $lines.Count
-        for ($i = $featureIdx + 1; $i -lt $lines.Count; $i++) {
-            if ($lines[$i].Trim().StartsWith('[')) { $end = $i; break }
-        }
-
-        $keyIdx = -1
-        for ($i = $featureIdx + 1; $i -lt $end; $i++) {
-            if ($lines[$i] -match '^\s*respect_system_proxy\s*=') { $keyIdx = $i; break }
-        }
-
-        if ($keyIdx -ge 0) {
-            if ($lines[$keyIdx].Trim() -eq 'respect_system_proxy = true') {
-                return 'already set to true - nothing to change'
-            }
-            $lines[$keyIdx] = 'respect_system_proxy = true'
-            $result = 'updated the existing respect_system_proxy key to true'
-        } else {
-            $lines.Insert($featureIdx + 1, 'respect_system_proxy = true')
-            $result = 'inserted respect_system_proxy = true into the existing [features] table'
-        }
-    }
-
-    $text = ($lines -join $eol)
-    if ($hadTrailingNewline) { $text += $eol }
-    [System.IO.File]::WriteAllText($Path, $text, $Utf8NoBom)
-    return $result
+    $plan = Get-RespectSystemProxyPlan -Text ([System.IO.File]::ReadAllText($Path))
+    if (-not $plan.Changed) { return $plan.Description }
+    Write-AtomicTextFile -Path $Path -Text $plan.Text
+    return $plan.Description
 }
 
 # ---------------------------------------------------------------------------
@@ -477,10 +442,25 @@ if (-not (Test-Path $ConfigPath)) {
     exit 1
 }
 
+try {
+    $configPlan = Get-RespectSystemProxyPlan -Text ([System.IO.File]::ReadAllText($ConfigPath))
+} catch {
+    Write-Host ''
+    Write-Host ("REFUSED - config.toml cannot be changed safely: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    exit 4
+}
+
 # ---- read the current state ----------------------------------------------
 $props = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
-$currentEnable = if ($props) { [int]$props.ProxyEnable } else { 0 }
-$currentServer = if ($props) { [string]$props.ProxyServer } else { '' }
+$enableExists = [bool]($props -and $props.PSObject.Properties['ProxyEnable'])
+$serverExists = [bool]($props -and $props.PSObject.Properties['ProxyServer'])
+$autoConfigExists = [bool]($props -and $props.PSObject.Properties['AutoConfigURL'])
+$autoDetectExists = [bool]($props -and $props.PSObject.Properties['AutoDetect'])
+$currentEnable = if ($enableExists) { [int]$props.ProxyEnable } else { 0 }
+$currentServer = if ($serverExists) { [string]$props.ProxyServer } else { '' }
+$currentAutoConfig = if ($autoConfigExists) { [string]$props.AutoConfigURL } else { '' }
+$currentAutoDetect = if ($autoDetectExists) { [int]$props.AutoDetect } else { 0 }
+$proxyClassification = Get-ProxyServerClassification -ProxyServer $currentServer
 
 $portInfo  = Resolve-ProxyPort -CurrentProxyServer $currentServer
 $proxyPort = [int]$portInfo.Port
@@ -540,7 +520,10 @@ if ($portLive -and -not $SkipProxyCheck) {
 }
 
 $refused = $null
-if (-not $portLive) {
+if (-not $SkipSystemProxy -and -not $Force -and
+    (($currentAutoConfig -ne '') -or ($currentAutoDetect -ne 0) -or (-not $proxyClassification.SafeToReplace))) {
+    $refused = 'The current Windows proxy uses PAC/WPAD, per-protocol, or custom routing. It will not be overwritten implicitly.'
+} elseif (-not $portLive) {
     $refused = ("Nothing is listening on 127.0.0.1:{0}. " -f $proxyPort)
     if (-not $SkipSystemProxy) {
         $refused += 'Pointing the Windows system proxy at a dead port would take this machine offline ' +
@@ -553,10 +536,10 @@ if (-not $portLive) {
     } else {
         $refused += '  Start your proxy client - or its local inbound port changed.'
     }
-} elseif (-not $SkipSystemProxy -and $chain -and -not $chain.Ok) {
+} elseif ($chain -and -not $chain.Ok) {
     $refused = ("127.0.0.1:{0} is listening but traffic through it cannot reach chatgpt.com." -f $proxyPort) +
-               ' Writing it into the system proxy would break normal browsing too. Fix the proxy chain (node / ' +
-               'subscription / outbound) first.'
+               ' The requested route is known-bad, including environment-only mode. Fix the proxy chain ' +
+               '(node / subscription / outbound) first.'
 }
 
 if ($refused -and -not $Force) {
@@ -578,34 +561,100 @@ if ($refused -and $Force) {
 }
 
 # ---- backups -------------------------------------------------------------
+$environmentState = [ordered]@{}
+foreach ($name in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')) {
+    $value = [System.Environment]::GetEnvironmentVariable($name, 'User')
+    $environmentState[$name] = New-ExactValueState -Exists ($null -ne $value) -Value $value
+}
+$systemChangeNeeded = (-not $SkipSystemProxy) -and -not ($currentEnable -eq 1 -and $currentServer.Trim() -eq $target)
+$environmentChangeNeeded = $SetEnvironmentVariables -and (
+    [string]$environmentState.HTTP_PROXY.value -ne "http://127.0.0.1:$proxyPort" -or
+    [string]$environmentState.HTTPS_PROXY.value -ne "http://127.0.0.1:$proxyPort" -or
+    [string]$environmentState.NO_PROXY.value -ne '127.0.0.1,localhost,::1')
+$mutationNeeded = $systemChangeNeeded -or $configPlan.Changed -or $environmentChangeNeeded
 $backupDir = $null
-if (-not $DryRun) {
+if (-not $DryRun -and $mutationNeeded) {
     $backupDir = Join-Path $BackupRoot $Stamp
     New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
 }
 
 Write-Head 'Step 1/3  Back up the current state'
 if ($DryRun) {
-    Write-Item ("would copy {0} -> {1}" -f $ConfigPath, (Join-Path $BackupRoot "$Stamp\config.toml"))
-    Write-Item ("would record system proxy enable={0} server='{1}'" -f $currentEnable, $currentServer)
+    if ($mutationNeeded) {
+        Write-Item ("would copy {0} -> {1}" -f $ConfigPath, (Join-Path $BackupRoot "$Stamp\config.toml"))
+        Write-Item ("would record system proxy enable={0} server='{1}'" -f $currentEnable, $currentServer)
+    } else {
+        Write-Item 'no mutation is required; no backup would be created'
+    }
 } else {
+    if (-not $mutationNeeded) {
+        Write-Item 'no mutation is required; no backup will be created'
+    } else {
     Copy-Item -Path $ConfigPath -Destination (Join-Path $backupDir 'config.toml') -Force
     $state = [pscustomobject]@{
+        schemaVersion   = 2
+        mutationId      = [guid]::NewGuid().ToString('N')
         createdAt       = (Get-Date -Format 'o')
         codexHome       = $CodexHome
-        proxyEnable     = $currentEnable
-        proxyServer     = $currentServer
+        configPath      = $ConfigPath
+        configExisted   = $true
+        proxyEnable     = New-ExactValueState -Exists $enableExists -Value $currentEnable
+        proxyServer     = New-ExactValueState -Exists $serverExists -Value $currentServer
+        autoConfigUrl   = New-ExactValueState -Exists $autoConfigExists -Value $currentAutoConfig
+        autoDetect      = New-ExactValueState -Exists $autoDetectExists -Value $currentAutoDetect
         proxyPortUsed   = $proxyPort
-        envVarsSet      = [bool]$SetEnvironmentVariables
+        environment     = $environmentState
+        requested       = [pscustomobject]@{ systemProxy = (-not $SkipSystemProxy); environment = [bool]$SetEnvironmentVariables }
+        completedMutations = @()
+        completed       = $false
     }
     [System.IO.File]::WriteAllText(
         (Join-Path $backupDir 'state.json'),
-        ($state | ConvertTo-Json -Depth 3),
+        ($state | ConvertTo-Json -Depth 8),
         $Utf8NoBom)
     Write-Item ("config.toml  -> {0}" -f (Join-Path $backupDir 'config.toml'))
     Write-Item ("state.json   -> {0}" -f (Join-Path $backupDir 'state.json'))
     $script:Changes.Add("backup created at $backupDir")
+    }
 }
+
+function Save-TransactionState {
+    if (-not $backupDir) { return }
+    [System.IO.File]::WriteAllText((Join-Path $backupDir 'state.json'), ($state | ConvertTo-Json -Depth 8), $Utf8NoBom)
+}
+
+function Restore-ExactRegistryValue {
+    param([string]$Name, [object]$Saved, [string]$Type)
+    if ($Saved.exists) {
+        Set-ItemProperty -Path $RegPath -Name $Name -Value $Saved.value -Type $Type -ErrorAction Stop
+    } else {
+        Remove-ItemProperty -Path $RegPath -Name $Name -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-CompensatingRollback {
+    $unrecovered = New-Object System.Collections.Generic.List[string]
+    foreach ($mutation in (Get-ReversedMutationList -Mutations @($state.completedMutations))) {
+        try {
+            switch ($mutation) {
+                'environment' {
+                    foreach ($name in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')) {
+                        $saved = $state.environment[$name]
+                        [System.Environment]::SetEnvironmentVariable($name, $(if ($saved.exists) { [string]$saved.value } else { $null }), 'User')
+                    }
+                }
+                'config' { Copy-Item -LiteralPath (Join-Path $backupDir 'config.toml') -Destination $ConfigPath -Force }
+                'systemProxy' {
+                    Restore-ExactRegistryValue -Name 'ProxyEnable' -Saved $state.proxyEnable -Type DWord
+                    Restore-ExactRegistryValue -Name 'ProxyServer' -Saved $state.proxyServer -Type String
+                }
+            }
+        } catch { $unrecovered.Add(("{0}: {1}" -f $mutation, $_.Exception.Message)) }
+    }
+    return $unrecovered
+}
+
+try {
 
 # ---- step 2: system proxy ------------------------------------------------
 Write-Head 'Step 2/3  Restore the Windows system proxy'
@@ -618,6 +667,8 @@ if ($SkipSystemProxy) {
         Write-Item ("would set ProxyEnable=1  ProxyServer='{0}'  (was enable={1} server='{2}')" -f $target, $currentEnable, $currentServer)
     } else {
         try {
+            $state.completedMutations += 'systemProxy'
+            Save-TransactionState
             Set-ItemProperty -Path $RegPath -Name ProxyEnable -Value 1      -Type DWord  -ErrorAction Stop
             Set-ItemProperty -Path $RegPath -Name ProxyServer -Value $target -Type String -ErrorAction Stop
             $check = Get-ItemProperty -Path $RegPath
@@ -625,12 +676,10 @@ if ($SkipSystemProxy) {
                 Write-Item ("FIXED: enable={0} server='{1}'  ->  enable=1 server='{2}'" -f $currentEnable, $currentServer, $target)
                 $script:Changes.Add("system proxy restored to $target (was enable=$currentEnable server='$currentServer')")
             } else {
-                Write-Item 'ERROR: the registry did not keep the new values'
-                exit 3
+                throw 'the registry did not keep the new values'
             }
         } catch {
-            Write-Host ('   ERROR: registry write failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
-            exit 3
+            throw ('registry write failed: {0}' -f $_.Exception.Message)
         }
     }
 }
@@ -638,22 +687,20 @@ if ($SkipSystemProxy) {
 # ---- step 3: config.toml -------------------------------------------------
 Write-Head 'Step 3/3  Enable [features] respect_system_proxy in config.toml'
 if ($DryRun) {
-    $raw = [System.IO.File]::ReadAllText($ConfigPath)
-    if ($raw -match '(?m)^\s*respect_system_proxy\s*=\s*true\s*$') {
-        Write-Item 'already set to true - nothing to change'
-    } else {
-        Write-Item 'would set respect_system_proxy = true under [features]'
-    }
+    Write-Item $(if ($configPlan.Changed) { 'would set respect_system_proxy = true under [features]' } else { $configPlan.Description })
 } else {
     try {
-        $description = Set-RespectSystemProxyFeature -Path $ConfigPath
+        if ($configPlan.Changed) {
+            $state.completedMutations += 'config'
+            Save-TransactionState
+        }
+        $description = if ($configPlan.Changed) { Set-RespectSystemProxyFeature -Path $ConfigPath } else { $configPlan.Description }
         Write-Item $description
         if ($description -notlike 'already*') {
             $script:Changes.Add("config.toml: $description")
         }
     } catch {
-        Write-Host ('   ERROR: could not edit config.toml: {0}' -f $_.Exception.Message) -ForegroundColor Red
-        exit 3
+        throw ('could not edit config.toml: {0}' -f $_.Exception.Message)
     }
 }
 
@@ -668,6 +715,15 @@ if ($SetEnvironmentVariables) {
         if ($DryRun) {
             Write-Item ("would set {0}={1}" -f $pair.Name, $pair.Value)
         } else {
+            $savedEnvironmentValue = $environmentState[$pair.Name]
+            if ($savedEnvironmentValue.exists -and [string]$savedEnvironmentValue.value -eq $pair.Value) {
+                Write-Item ("{0} already has the requested value" -f $pair.Name)
+                continue
+            }
+            if ($environmentChangeNeeded -and -not (@($state.completedMutations) -contains 'environment')) {
+                $state.completedMutations += 'environment'
+                Save-TransactionState
+            }
             [System.Environment]::SetEnvironmentVariable($pair.Name, $pair.Value, 'User')
             Write-Item ("{0}={1}" -f $pair.Name, $pair.Value)
         }
@@ -676,6 +732,19 @@ if ($SetEnvironmentVariables) {
         $script:Changes.Add('user environment variables HTTP_PROXY / HTTPS_PROXY / NO_PROXY set')
         Write-Item 'note: environment variables only reach apps launched after this change'
     }
+}
+
+if (-not $DryRun -and $mutationNeeded) { $state.completed = $true; Save-TransactionState }
+} catch {
+    Write-Host ('   ERROR: {0}' -f $_.Exception.Message) -ForegroundColor Red
+    $unrecovered = @(Invoke-CompensatingRollback)
+    if ($unrecovered.Count -eq 0) {
+        Write-Host '   All earlier mutations from this run were restored.'
+    } else {
+        Write-Host '   WARNING: these surfaces could not be restored:' -ForegroundColor Red
+        foreach ($failure in $unrecovered) { Write-Host ('     * {0}' -f $failure) }
+    }
+    exit 3
 }
 
 # ---- summary -------------------------------------------------------------

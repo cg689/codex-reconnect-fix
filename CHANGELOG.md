@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- 跨机器安全加固：遵循 `CODEX_HOME`，保守解析含引号/注释的 TOML，并在重复表、重复键或非布尔值时拒绝写入。
+- `Fix` 改为唯一备份与补偿事务，精确记录注册表及用户代理环境变量原有的存在状态和值。
+- `Diagnose` 支持 `ALL_PROXY` 路由、报告凭据脱敏，并禁止跳过/失败探测时输出健康结论。
+- `Rollback` 验证备份 schema 和完整状态，只自动选择真实改动备份，部分恢复失败时返回非零并逐项报告。
+- 双击启动器只解除当前目标脚本的下载阻止标记；新增 Windows PowerShell 5.1 / PowerShell 7 隔离回归测试。
+
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的组织方式。
 
 ## [1.1.1] - 2026-09-10

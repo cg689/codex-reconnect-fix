@@ -1,0 +1,1732 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6b2d4ca..0ea64d8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,13 @@
+ # Changelog
+ 
++## Unreleased
++
++- 跨机器安全加固：遵循 `CODEX_HOME`，保守解析含引号/注释的 TOML，并在重复表、重复键或非布尔值时拒绝写入。
++- `Fix` 改为唯一备份与补偿事务，精确记录注册表及用户代理环境变量原有的存在状态和值。
++- `Diagnose` 支持 `ALL_PROXY` 路由、报告凭据脱敏，并禁止跳过/失败探测时输出健康结论。
++- `Rollback` 验证备份 schema 和完整状态，只自动选择真实改动备份，部分恢复失败时返回非零并逐项报告。
++- 双击启动器只解除当前目标脚本的下载阻止标记；新增 Windows PowerShell 5.1 / PowerShell 7 隔离回归测试。
++
+ 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的组织方式。
+ 
+ ## [1.1.1] - 2026-09-10
+diff --git a/Diagnose.cmd b/Diagnose.cmd
+index 640cb81..b473877 100644
+--- a/Diagnose.cmd
++++ b/Diagnose.cmd
+@@ -30,7 +30,7 @@ echo ============================================================
+ echo  Codex Reconnect - DIAGNOSE   (read-only, changes nothing)
+ echo ============================================================
+ echo.
+-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath '%HERE%scripts' -Filter *.ps1 -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue" >nul 2>&1
++powershell -NoProfile -ExecutionPolicy Bypass -Command "Unblock-File -LiteralPath '%TARGET%' -ErrorAction SilentlyContinue" >nul 2>&1
+ powershell -NoProfile -ExecutionPolicy Bypass -File "%TARGET%" %*
+ set "RC=%ERRORLEVEL%"
+ echo.
+diff --git a/Fix.cmd b/Fix.cmd
+index 7d3ac1c..0b547f1 100644
+--- a/Fix.cmd
++++ b/Fix.cmd
+@@ -31,7 +31,7 @@ echo ============================================================
+ echo  Codex Reconnect - FIX   (backs up first, refuses unsafe changes)
+ echo ============================================================
+ echo.
+-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath '%HERE%scripts' -Filter *.ps1 -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue" >nul 2>&1
++powershell -NoProfile -ExecutionPolicy Bypass -Command "Unblock-File -LiteralPath '%TARGET%' -ErrorAction SilentlyContinue" >nul 2>&1
+ powershell -NoProfile -ExecutionPolicy Bypass -File "%TARGET%" %*
+ set "RC=%ERRORLEVEL%"
+ echo.
+diff --git a/README.md b/README.md
+index 518c926..080375a 100644
+--- a/README.md
++++ b/README.md
+@@ -92,6 +92,10 @@ cd codex-reconnect-fix\scripts
+ | 修复 1 | `ProxyEnable=1`、`ProxyServer=127.0.0.1:<端口>` | `HKCU\...\Internet Settings` |
+ | 修复 2 | 在 `[features]` 下写入 `respect_system_proxy = true` | `<CodexHome>\config.toml` |
+ 
++脚本优先使用显式 `-CodexHome`，其次读取 `CODEX_HOME`，最后才使用 `%USERPROFILE%\.codex`。每次真实改动创建唯一备份；若后续写入失败，会按相反顺序恢复本次已完成的改动，并明确列出任何未能恢复的表面。
++
++为避免破坏公司网络，PAC/WPAD、按协议拆分的 `ProxyServer` 或其他复杂路由不会被静默覆盖；需要人工确认时脚本返回拒绝/未验证，而不是猜测。`Diagnose -SkipNetworkTest` 也不会输出健康结论，含用户名密码的代理 URL 会在屏幕和报告中脱敏。
++
+ **为什么有那道安全检查**：把 Windows 系统代理指向一个**没人监听的端口**，会让整台机器断网（所有 HTTPS 请求都失败）。所以脚本在写注册表**之前**会先确认端口可用；不通过时它什么都不写，直接退出（退出码 `4`），并告诉你怎么继续。确认自己清楚风险时可以用 `-Force` 跳过。
+ 
+ 这道检查分两层，`-SkipProxyCheck` 只会关掉第二层：
+diff --git a/Rollback.cmd b/Rollback.cmd
+index a46cb3c..7b41e5e 100644
+--- a/Rollback.cmd
++++ b/Rollback.cmd
+@@ -26,7 +26,7 @@ echo ============================================================
+ echo  Codex Reconnect - ROLLBACK   (undoes the last FIX)
+ echo ============================================================
+ echo.
+-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath '%HERE%scripts' -Filter *.ps1 -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue" >nul 2>&1
++powershell -NoProfile -ExecutionPolicy Bypass -Command "Unblock-File -LiteralPath '%TARGET%' -ErrorAction SilentlyContinue" >nul 2>&1
+ powershell -NoProfile -ExecutionPolicy Bypass -File "%TARGET%" %*
+ set "RC=%ERRORLEVEL%"
+ echo.
+diff --git a/config/config.example.toml b/config/config.example.toml
+index 08fcf7a..51c3a02 100644
+--- a/config/config.example.toml
++++ b/config/config.example.toml
+@@ -3,6 +3,8 @@
+ # Merge the keys below into your own ~/.codex/config.toml.
+ # Do NOT overwrite the whole file - Codex stores your plugins, trusted projects
+ # and desktop preferences there too.
++# If [features] already exists, copy only respect_system_proxy into that table;
++# TOML does not allow a second logical [features] table (quoted names count too).
+ #
+ # Notes
+ #   * The file must be UTF-8 WITHOUT BOM. A BOM makes the TOML parser fail and
+diff --git "a/docs/03-\345\270\270\350\247\201\351\227\256\351\242\230.md" "b/docs/03-\345\270\270\350\247\201\351\227\256\351\242\230.md"
+index 063320d..9060368 100644
+--- "a/docs/03-\345\270\270\350\247\201\351\227\256\351\242\230.md"
++++ "b/docs/03-\345\270\270\350\247\201\351\227\256\351\242\230.md"
+@@ -6,7 +6,7 @@
+ 
+ 1. **完全退出客户端再启动**。`respect_system_proxy` 只在构建 HTTP client 时读取一次，热重载无效。注意托盘图标 —— 关窗口不等于退出进程。
+ 2. **重跑体检**：`.\Diagnose-CodexReconnect.ps1`，看 `[4]` 端口是否 listen、`[5]` 经代理请求是否通。
+-3. **确认改的是一份配置**。Codex 的 Home 由 `CODEX_HOME` 环境变量决定，默认 `%USERPROFILE%\.codex`。如果你的安装用了别的目录，脚本会改错地方 —— 用 `-CodexHome <路径>` 指过去。
++3. **确认改的是同一份配置**。脚本优先使用 `-CodexHome`，其次自动读取 `CODEX_HOME`，最后才回退到 `%USERPROFILE%\.codex`。
+ 4. 三条都 OK 还重连，问题在**代理链路本身**（节点失效 / 订阅过期 / 出站配置错），换节点试。
+ 
+ ## Q2. 会影响历史会话吗？
+@@ -164,7 +164,7 @@ respect_system_proxy = true
+ 
+ 不碰：`auth.json`、登录态、插件配置、`model_provider`、其他注册表项。不装常驻进程，不建计划任务。先跑 `-DryRun` 可以逐条看清打算做什么。
+ 
+-**改系统代理前有一道闸**：先确认目标端口在监听（用内核的 TCP 监听表读，不是逐个连接试探），再确认经它能连通 chatgpt.com。任何一条不过就什么都不写并退出码 `4`（见 Q4c）。原始值已存进备份目录的 `state.json`，`Rollback` 会原样写回 —— 包括把 `ProxyEnable` 恢复成 `0`。
++**改系统代理前有一道闸**：先确认目标端口在监听，再确认经它能连通 chatgpt.com。PAC/WPAD、按协议拆分或自定义代理路由默认拒绝覆盖。任何一条不过就什么都不写并退出码 `4`。原始配置、注册表值的存在状态/值、以及四个用户代理环境变量都会写进唯一备份；后续写入失败时脚本立即补偿回滚，`Rollback` 也只选择完整、有效且确实包含改动的备份。
+ 
+ 诊断脚本对系统是「读多写无」，修复脚本对系统是「先验后写、写前备份、可一键撤回」。这也是它比一条手工命令更值得用的地方。
+ 
+@@ -192,7 +192,7 @@ respect_system_proxy = true
+ 
+ 新建对话发一条消息，秒回且**没有** `Reconnecting 1/5` 提示，就是好了。
+ 
+-想更严谨，改动前后各跑一次 `Diagnose` 并对比：`-ReportPath before.txt` / `-ReportPath after.txt`。判据是 `[3] respect_system_proxy` 从 `FAIL` 变成 `OK`，末尾 VERDICT 从 `ROOT CAUSE FOUND` 变成 `OK - configuration is consistent`。
++想更严谨，改动前后各跑一次 `Diagnose` 并对比：`-ReportPath before.txt` / `-ReportPath after.txt`。只有实际验证了所选路由才会输出 `VERDICT: OK`；跳过网络测试、探测失败或复杂路由只能得到 `UNVERIFIED`/问题结论。报告中的代理凭据会自动脱敏。
+ 
+ ## Q13. 怎么彻底卸载？
+ 
+diff --git a/scripts/Diagnose-CodexReconnect.ps1 b/scripts/Diagnose-CodexReconnect.ps1
+index 5b4a3be..b2df43e 100644
+--- a/scripts/Diagnose-CodexReconnect.ps1
++++ b/scripts/Diagnose-CodexReconnect.ps1
+@@ -62,7 +62,7 @@
+ [CmdletBinding()]
+ param(
+     [int]$Port = 0,
+-    [string]$CodexHome = (Join-Path $env:USERPROFILE '.codex'),
++    [string]$CodexHome,
+     [switch]$SkipNetworkTest,
+     [int]$TimeoutSec = 12,
+     [string]$ReportPath
+@@ -70,6 +70,16 @@ param(
+ 
+ $ErrorActionPreference = 'Stop'
+ 
++. (Join-Path $PSScriptRoot 'CodexReconnect.Common.ps1')
++
++try {
++    Assert-CodexReconnectParameters -Port $Port -TimeoutSec $TimeoutSec
++    $CodexHome = Resolve-CodexReconnectHome -RequestedHome $CodexHome
++} catch {
++    Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
++    exit 2
++}
++
+ # ---------------------------------------------------------------------------
+ # output helpers
+ # ---------------------------------------------------------------------------
+@@ -87,8 +97,9 @@ $script:ListeningPorts    = @()
+ 
+ function Out-Line {
+     param([string]$Text = '')
+-    $script:Report.Add($Text)
+-    Write-Host $Text
++    $safeText = Protect-SensitiveText -Text $Text
++    $script:Report.Add($safeText)
++    Write-Host $safeText
+ }
+ 
+ function Out-Row {
+@@ -99,7 +110,7 @@ function Out-Row {
+         'fail' { 'FAIL' }
+         default { '    ' }
+     }
+-    Out-Line ('    {0} {1,-22}: {2}' -f $tag, $Label, $Value)
++    Out-Line ('    {0} {1,-22}: {2}' -f $tag, $Label, (Protect-SensitiveText -Text $Value))
+ }
+ 
+ function Add-Finding {
+@@ -117,7 +128,7 @@ function Get-SystemProxyState {
+         $p = Get-ItemProperty -Path $reg -ErrorAction Stop
+     } catch {
+         return [pscustomobject]@{
+-            Readable = $false; ProxyEnable = 0; ProxyServer = ''; AutoConfigURL = ''
++            Readable = $false; ProxyEnable = 0; ProxyServer = ''; AutoConfigURL = ''; AutoDetect = 0
+         }
+     }
+     [pscustomobject]@{
+@@ -125,6 +136,7 @@ function Get-SystemProxyState {
+         ProxyEnable   = [int]$p.ProxyEnable
+         ProxyServer   = [string]$p.ProxyServer
+         AutoConfigURL = [string]$p.AutoConfigURL
++        AutoDetect    = [int]$p.AutoDetect
+     }
+ }
+ 
+@@ -505,6 +517,11 @@ if ($portInfo.Candidates.Count -gt 1) {
+ $envProxyOk = $false
+ $featureOk  = $false
+ $systemOk   = $false
++$routeConfigured = $false
++$httpProxy = [System.Environment]::GetEnvironmentVariable('HTTP_PROXY')
++$httpsProxy = [System.Environment]::GetEnvironmentVariable('HTTPS_PROXY')
++$allProxy = [System.Environment]::GetEnvironmentVariable('ALL_PROXY')
++$envProxyOk = [bool]($httpProxy -or $httpsProxy -or $allProxy)
+ 
+ # ---- [1] Windows system proxy --------------------------------------------
+ Out-Line '[1] Windows system proxy  (HKCU\...\Internet Settings)'
+@@ -512,19 +529,19 @@ if (-not $proxyState.Readable) {
+     Out-Row -Label 'Registry' -Value 'could not be read' -State 'warn'
+ } else {
+     $expected = "127.0.0.1:$portValue"
+-    $systemOk = ($proxyState.ProxyEnable -eq 1 -and $proxyState.ProxyServer.Trim() -eq $expected)
++    $proxyClassification = Get-ProxyServerClassification -ProxyServer $proxyState.ProxyServer
++    $systemOk = ($proxyState.ProxyEnable -eq 1 -and $proxyClassification.Kind -eq 'simple-local' -and $proxyClassification.Port -eq $portValue -and [string]::IsNullOrEmpty($proxyState.AutoConfigURL))
+ 
+     if ($proxyState.ProxyEnable -eq 1) {
+         Out-Row -Label 'ProxyEnable' -Value '1 (on)' -State 'ok'
+     } else {
+-        Out-Row -Label 'ProxyEnable' -Value '0 (system proxy is OFF)' -State 'fail'
+-        Add-Finding 'fail' ('The Windows system proxy is disabled. Even with respect_system_proxy = true, ' +
+-                             'the Codex backend has nothing to respect. Enable the system proxy in your proxy client.')
++        Out-Row -Label 'ProxyEnable' -Value '0 (system proxy is OFF)' -State $(if ($envProxyOk) { 'warn' } else { 'fail' })
++        Add-Finding 'warn' 'The Windows system proxy is disabled; this is acceptable only when a working proxy environment variable supplies the route.'
+     }
+ 
+     if ($proxyState.ProxyServer -eq '') {
+         Out-Row -Label 'ProxyServer' -Value '(empty)' -State $(if ($systemOk) { 'ok' } else { 'warn' })
+-    } elseif ($proxyState.ProxyServer.Trim() -eq $expected) {
++    } elseif ($proxyClassification.Kind -eq 'simple-local' -and $proxyClassification.Port -eq $portValue) {
+         Out-Row -Label 'ProxyServer' -Value $proxyState.ProxyServer -State 'ok'
+     } else {
+         Out-Row -Label 'ProxyServer' -Value ("{0}   (expected {1})" -f $proxyState.ProxyServer, $expected) -State 'warn'
+@@ -544,6 +561,9 @@ if (-not $proxyState.Readable) {
+     } else {
+         Out-Row -Label 'AutoConfigURL' -Value '(none)' -State 'ok'
+     }
++    if ($proxyClassification.Kind -in @('complex', 'custom')) {
++        Add-Finding 'warn' 'The system proxy uses complex routing that cannot be verified by a single local-port probe.'
++    }
+ }
+ Out-Line ''
+ 
+@@ -560,9 +580,6 @@ foreach ($name in $envNames) {
+         Out-Row -Label $name -Value '(not set)' -State ''
+     }
+ }
+-$httpProxy = [System.Environment]::GetEnvironmentVariable('HTTP_PROXY')
+-$httpsProxy = [System.Environment]::GetEnvironmentVariable('HTTPS_PROXY')
+-$envProxyOk = [bool]($httpProxy -or $httpsProxy)
+ Out-Line ''
+ 
+ # ---- [3] Codex feature switch --------------------------------------------
+@@ -573,60 +590,58 @@ if (-not (Test-Path $configPath)) {
+ } else {
+     Out-Row -Label 'config.toml' -Value $configPath -State 'ok'
+     $raw = Get-Content -Path $configPath -Raw -Encoding UTF8
+-    $flagValue = Get-TomlScalar -Text $raw -Table 'features' -Key 'respect_system_proxy'
+-    $featureOk = Test-Truthy $flagValue
++    try {
++        $flagValue = Get-RespectSystemProxyValue -Text $raw
++        $featureOk = Test-TomlTrue $flagValue
++    } catch {
++        $flagValue = $null
++        $featureOk = $false
++        Add-Finding 'fail' ("config.toml is invalid or ambiguous: {0}" -f $_.Exception.Message)
++    }
+ 
+     if ($featureOk) {
+         Out-Row -Label 'respect_system_proxy' -Value 'true' -State 'ok'
+     } elseif ($null -eq $flagValue) {
+-        Out-Row -Label 'respect_system_proxy' -Value 'absent from [features]' -State 'fail'
+-        Add-Finding 'fail' 'respect_system_proxy is not set. The Codex backend will ignore the Windows system proxy and try to connect directly.'
++        Out-Row -Label 'respect_system_proxy' -Value 'absent from [features]' -State $(if ($envProxyOk) { 'warn' } else { 'fail' })
++        Add-Finding $(if ($envProxyOk) { 'warn' } else { 'fail' }) 'respect_system_proxy is absent. A working proxy environment variable can still supply the route.'
+     } else {
+-        Out-Row -Label 'respect_system_proxy' -Value ("{0} (not enabled)" -f $flagValue) -State 'fail'
+-        Add-Finding 'fail' 'respect_system_proxy is set but not true. The Codex backend will ignore the Windows system proxy.'
++        Out-Row -Label 'respect_system_proxy' -Value ("{0} (not enabled)" -f $flagValue) -State $(if ($envProxyOk) { 'warn' } else { 'fail' })
++        Add-Finding $(if ($envProxyOk) { 'warn' } else { 'fail' }) 'respect_system_proxy is not true. A working proxy environment variable can still supply the route.'
+     }
+ }
+ Out-Line ''
+ 
++$effectiveRoute = Get-EffectiveProxyRoute -Environment ([pscustomobject]@{
++    HTTP_PROXY = $httpProxy; HTTPS_PROXY = $httpsProxy; ALL_PROXY = $allProxy
++}) -FeatureEnabled $featureOk -ProxyEnable $proxyState.ProxyEnable -ProxyServer $proxyState.ProxyServer -AutoConfigUrl $proxyState.AutoConfigURL -AutoDetect $proxyState.AutoDetect
++
+ # ---- [4] proxy port reachability -----------------------------------------
+ $portOpen = $null
+-if (-not $SkipNetworkTest) {
+-    Out-Line '[4] Proxy port reachability'
+-    $portOpen = Test-TcpPort -TargetHost '127.0.0.1' -TargetPort $portValue
++if (-not $SkipNetworkTest -and $effectiveRoute.Verifiable) {
++    Out-Line '[4] Selected proxy endpoint reachability'
++    $portOpen = Test-TcpPort -TargetHost $effectiveRoute.Host -TargetPort $effectiveRoute.Port
+     if ($portOpen) {
+-        Out-Row -Label ("127.0.0.1:{0}" -f $portValue) -Value 'accepting TCP connections' -State 'ok'
++        Out-Row -Label ("{0}:{1}" -f $effectiveRoute.Host, $effectiveRoute.Port) -Value ("accepting TCP connections ({0})" -f $effectiveRoute.Source) -State 'ok'
+     } else {
+-        Out-Row -Label ("127.0.0.1:{0}" -f $portValue) -Value 'closed - nothing is listening' -State 'fail'
+-
+-        $liveAlternatives = @($portInfo.Candidates | Where-Object { $_.Live -eq $true -and [int]$_.Port -ne $portValue } |
+-                              ForEach-Object { $_.Port })
+-
+-        if ($portInfo.Authoritative) {
+-            Add-Finding 'fail' ("Nothing answers on 127.0.0.1:{0}, which is the port your Windows system proxy is set to. " -f $portValue) +
+-                                'Start the proxy client - without a live local proxy port nothing can be fixed by configuration alone.'
+-        } elseif ($portInfo.Forced) {
+-            Add-Finding 'fail' ("Nothing answers on 127.0.0.1:{0}, the port you passed with -Port. " -f $portValue) +
+-                                'Either the proxy client is not running, or that is not its inbound port.'
+-        } else {
+-            $hint = ("Nothing answers on 127.0.0.1:{0}, and {0} was only a guess: no proxy client was detected and the " -f $portValue) +
+-                    'Windows system proxy does not name a port. Your real local port is probably different.'
+-            if ($liveAlternatives.Count -gt 0) {
+-                $hint += (' A live port was found on this machine though: {0} - retry with -Port {1}.' -f
+-                          (($liveAlternatives -join ', ')), $liveAlternatives[0])
+-            } else {
+-                $hint += ' Start your proxy client, then re-run this check.'
+-            }
+-            Add-Finding 'fail' $hint
+-        }
++        Out-Row -Label ("{0}:{1}" -f $effectiveRoute.Host, $effectiveRoute.Port) -Value 'closed or unreachable' -State 'fail'
++        Add-Finding 'fail' ("The selected route from {0} is not accepting TCP connections." -f $effectiveRoute.Source)
+     }
+     Out-Line ''
++} elseif (-not $SkipNetworkTest) {
++    Out-Line '[4] Selected proxy endpoint reachability'
++    Out-Row -Label $effectiveRoute.Source -Value $effectiveRoute.Reason -State 'warn'
++    Out-Line ''
++} else {
++    Out-Line '[4] Selected proxy endpoint reachability'
++    Out-Row -Label 'Status' -Value 'not tested (-SkipNetworkTest)' -State 'warn'
++    Out-Line ''
+ }
+ 
+ # ---- [5] end-to-end probes -----------------------------------------------
+ $proxyRequest = $null
+-if (-not $SkipNetworkTest) {
++if (-not $SkipNetworkTest -and $effectiveRoute.Verifiable) {
+     Out-Line '[5] End-to-end probes'
+-    $proxyUrl = "http://127.0.0.1:$portValue"
++    $proxyUrl = $effectiveRoute.ProxyUrl
+ 
+     $proxyRequest = Test-ProxiedRequest -Url 'https://chatgpt.com/backend-api/me' -ProxyUrl $proxyUrl -Timeout $TimeoutSec
+     if ($proxyRequest.Ok) {
+@@ -634,7 +649,7 @@ if (-not $SkipNetworkTest) {
+         Out-Row -Label 'via proxy (chatgpt.com)' -Value $proxyRequest.Detail -State 'ok'
+     } else {
+         Out-Row -Label 'via proxy (chatgpt.com)' -Value ('failed - ' + $proxyRequest.Detail) -State 'fail'
+-        $chainHint = ("The local proxy at 127.0.0.1:{0} cannot reach chatgpt.com. " -f $portValue) +
++        $chainHint = ("The selected proxy route '{0}' cannot reach chatgpt.com. " -f (Protect-SensitiveText -Text $proxyUrl)) +
+                      'The proxy chain itself is the problem (dead node / expired subscription / wrong outbound). Fix that first.'
+         Add-Finding 'fail' $chainHint
+     }
+@@ -646,10 +661,21 @@ if (-not $SkipNetworkTest) {
+         Out-Row -Label 'direct TCP 443' -Value 'blocked - a working proxy is mandatory here' -State 'warn'
+     }
+     Out-Line ''
++} elseif (-not $SkipNetworkTest) {
++    Out-Line '[5] End-to-end probes'
++    Out-Row -Label 'selected route' -Value $effectiveRoute.Reason -State 'warn'
++    Out-Line ''
++} else {
++    Out-Line '[5] End-to-end probes'
++    Out-Row -Label 'Status' -Value 'not tested (-SkipNetworkTest)' -State 'warn'
++    Out-Line ''
+ }
+ 
+ # ---- verdict -------------------------------------------------------------
+ $rootCauseHit = (-not $featureOk) -and (-not $envProxyOk)
++$routeConfigured = [bool]$effectiveRoute.Configured
++$hasFailure = [bool]($script:Findings | Where-Object { $_.Severity -eq 'fail' })
++$verdict = Get-DiagnoseVerdict -RouteConfigured $routeConfigured -RequiredProbeRan (-not $SkipNetworkTest) -RequiredProbePassed ([bool]($proxyRequest -and $proxyRequest.Ok)) -HasFailure $hasFailure
+ 
+ Out-Line '-------------------------------------------------------------'
+ if ($rootCauseHit) {
+@@ -660,20 +686,25 @@ if ($rootCauseHit) {
+     Out-Line '   * [features] respect_system_proxy is not enabled in config.toml, and'
+     Out-Line '   * no HTTP_PROXY / HTTPS_PROXY / ALL_PROXY environment variable is set.'
+     Out-Line ''
+-    Out-Line ' The Rust backend (ReqwestDefault strategy) only honours proxy environment'
+-    Out-Line ' variables - it never reads the Windows system proxy. So requests go direct,'
+-    Out-Line ' get blocked, and the client retries 5 times before degrading to plain HTTP.'
++    Out-Line ' The backend honours proxy environment variables directly, or the Windows'
++    Out-Line ' system proxy when respect_system_proxy is enabled. Neither route is active,'
++    Out-Line ' so requests go direct and can enter the reconnect loop.'
+     Out-Line ''
+     Out-Line ' Fix: run .\Fix-CodexReconnect.ps1   then restart the Codex / ChatGPT desktop app.'
+-} elseif ($featureOk -and $systemOk -and ($portOpen -ne $false)) {
++} elseif ($verdict -eq 'OK') {
+     Out-Line ' VERDICT: OK - configuration is consistent'
+     Out-Line '-------------------------------------------------------------'
+     Out-Line ''
+-    Out-Line ' The backend is allowed to use the system proxy and the proxy is alive.'
++    Out-Line (" The backend route through {0} passed the end-to-end probe." -f $effectiveRoute.Source)
+     Out-Line ' If you still see "Reconnecting 1/5", the proxy chain itself is likely at fault:'
+     Out-Line '   * test another node / protocol inside your proxy client'
+     Out-Line '   * check whether the subscription is expired'
+     Out-Line '   * prefer a node that does not rely on QUIC/UDP if WebSocket fallback matters'
++} elseif ($verdict -eq 'UNVERIFIED') {
++    Out-Line ' VERDICT: UNVERIFIED - required route evidence is missing'
++    Out-Line '-------------------------------------------------------------'
++    Out-Line ''
++    Out-Line ' A configured route was found, but the required live probe was skipped, failed, or did not verify that route.'
+ } else {
+     Out-Line ' VERDICT: PROBLEM(S) FOUND - see the FAIL/WARN rows above'
+     Out-Line '-------------------------------------------------------------'
+@@ -701,5 +732,5 @@ if ($ReportPath) {
+ }
+ 
+ if (-not (Test-Path $CodexHome)) { exit 2 }
+-if ($script:Findings | Where-Object { $_.Severity -eq 'fail' }) { exit 1 }
++if ($verdict -ne 'OK') { exit 1 }
+ exit 0
+diff --git a/scripts/Fix-CodexReconnect.ps1 b/scripts/Fix-CodexReconnect.ps1
+index 152d239..3d79e91 100644
+--- a/scripts/Fix-CodexReconnect.ps1
++++ b/scripts/Fix-CodexReconnect.ps1
+@@ -64,7 +64,7 @@
+ [CmdletBinding()]
+ param(
+     [int]$Port = 0,
+-    [string]$CodexHome = (Join-Path $env:USERPROFILE '.codex'),
++    [string]$CodexHome,
+     [switch]$SetEnvironmentVariables,
+     [switch]$SkipSystemProxy,
+     [switch]$DryRun,
+@@ -75,10 +75,20 @@ param(
+ 
+ $ErrorActionPreference = 'Stop'
+ 
++. (Join-Path $PSScriptRoot 'CodexReconnect.Common.ps1')
++
++try {
++    Assert-CodexReconnectParameters -Port $Port -TimeoutSec $ProxyTestTimeoutSec -TimeoutName 'ProxyTestTimeoutSec'
++    $CodexHome = Resolve-CodexReconnectHome -RequestedHome $CodexHome
++} catch {
++    Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
++    exit 1
++}
++
+ $RegPath     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+ $ConfigPath  = Join-Path $CodexHome 'config.toml'
+ $BackupRoot  = Join-Path $CodexHome 'reconnect-fix-backups'
+-$Stamp       = Get-Date -Format 'yyyyMMdd-HHmmss'
++$Stamp       = '{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss-fff'), ([guid]::NewGuid().ToString('N').Substring(0, 8))
+ $Utf8NoBom   = New-Object System.Text.UTF8Encoding($false)
+ 
+ $script:Changes = New-Object System.Collections.Generic.List[string]
+@@ -367,7 +377,8 @@ function Resolve-ProxyPort {
+         $raw.Add([pscustomobject]@{ Port = 10808; Source = 'default (nothing detected)' })
+     }
+ 
+-    # deduplicate; shortlist membership comes from the listen table (cheap)
++    # Deduplicate and probe every candidate, including ports discovered from client
++    # configuration that are not part of the small well-known-port shortlist.
+     $candidates = New-Object System.Collections.Generic.List[object]
+     $seen = @{}
+     foreach ($c in $raw) {
+@@ -375,7 +386,7 @@ function Resolve-ProxyPort {
+         if ($seen.ContainsKey($n)) { continue }
+         $seen[$n] = $true
+         $candidates.Add([pscustomobject]@{
+-            Port = $n; Source = $c.Source; Live = [bool]($listening -contains $n) })
++            Port = $n; Source = $c.Source; Live = (Test-TcpPort -TargetPort $n -TimeoutMs 600) })
+     }
+ 
+     $picked = $candidates | Where-Object { $_.Live } | Select-Object -First 1
+@@ -403,56 +414,10 @@ function Set-RespectSystemProxyFeature {
+     #>
+     param([string]$Path)
+ 
+-    $raw   = [System.IO.File]::ReadAllText($Path)
+-    $eol   = if ($raw -match "`r`n") { "`r`n" } else { "`n" }
+-    $lines = New-Object System.Collections.Generic.List[string]
+-    foreach ($l in ($raw -split "\r?\n")) { $lines.Add($l) }
+-
+-    # drop the single trailing element produced by a final newline
+-    $hadTrailingNewline = $raw -match "(\r?\n)$"
+-    if ($hadTrailingNewline -and $lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') {
+-        $lines.RemoveAt($lines.Count - 1)
+-    }
+-
+-    $featureIdx = -1
+-    for ($i = 0; $i -lt $lines.Count; $i++) {
+-        if ($lines[$i].Trim() -eq '[features]') { $featureIdx = $i; break }
+-    }
+-
+-    $result = ''
+-
+-    if ($featureIdx -lt 0) {
+-        $lines.Add('')
+-        $lines.Add('[features]')
+-        $lines.Add('respect_system_proxy = true')
+-        $result = 'appended a new [features] table with respect_system_proxy = true'
+-    } else {
+-        $end = $lines.Count
+-        for ($i = $featureIdx + 1; $i -lt $lines.Count; $i++) {
+-            if ($lines[$i].Trim().StartsWith('[')) { $end = $i; break }
+-        }
+-
+-        $keyIdx = -1
+-        for ($i = $featureIdx + 1; $i -lt $end; $i++) {
+-            if ($lines[$i] -match '^\s*respect_system_proxy\s*=') { $keyIdx = $i; break }
+-        }
+-
+-        if ($keyIdx -ge 0) {
+-            if ($lines[$keyIdx].Trim() -eq 'respect_system_proxy = true') {
+-                return 'already set to true - nothing to change'
+-            }
+-            $lines[$keyIdx] = 'respect_system_proxy = true'
+-            $result = 'updated the existing respect_system_proxy key to true'
+-        } else {
+-            $lines.Insert($featureIdx + 1, 'respect_system_proxy = true')
+-            $result = 'inserted respect_system_proxy = true into the existing [features] table'
+-        }
+-    }
+-
+-    $text = ($lines -join $eol)
+-    if ($hadTrailingNewline) { $text += $eol }
+-    [System.IO.File]::WriteAllText($Path, $text, $Utf8NoBom)
+-    return $result
++    $plan = Get-RespectSystemProxyPlan -Text ([System.IO.File]::ReadAllText($Path))
++    if (-not $plan.Changed) { return $plan.Description }
++    Write-AtomicTextFile -Path $Path -Text $plan.Text
++    return $plan.Description
+ }
+ 
+ # ---------------------------------------------------------------------------
+@@ -477,10 +442,25 @@ if (-not (Test-Path $ConfigPath)) {
+     exit 1
+ }
+ 
++try {
++    $configPlan = Get-RespectSystemProxyPlan -Text ([System.IO.File]::ReadAllText($ConfigPath))
++} catch {
++    Write-Host ''
++    Write-Host ("REFUSED - config.toml cannot be changed safely: {0}" -f $_.Exception.Message) -ForegroundColor Red
++    exit 4
++}
++
+ # ---- read the current state ----------------------------------------------
+ $props = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
+-$currentEnable = if ($props) { [int]$props.ProxyEnable } else { 0 }
+-$currentServer = if ($props) { [string]$props.ProxyServer } else { '' }
++$enableExists = [bool]($props -and $props.PSObject.Properties['ProxyEnable'])
++$serverExists = [bool]($props -and $props.PSObject.Properties['ProxyServer'])
++$autoConfigExists = [bool]($props -and $props.PSObject.Properties['AutoConfigURL'])
++$autoDetectExists = [bool]($props -and $props.PSObject.Properties['AutoDetect'])
++$currentEnable = if ($enableExists) { [int]$props.ProxyEnable } else { 0 }
++$currentServer = if ($serverExists) { [string]$props.ProxyServer } else { '' }
++$currentAutoConfig = if ($autoConfigExists) { [string]$props.AutoConfigURL } else { '' }
++$currentAutoDetect = if ($autoDetectExists) { [int]$props.AutoDetect } else { 0 }
++$proxyClassification = Get-ProxyServerClassification -ProxyServer $currentServer
+ 
+ $portInfo  = Resolve-ProxyPort -CurrentProxyServer $currentServer
+ $proxyPort = [int]$portInfo.Port
+@@ -540,7 +520,10 @@ if ($portLive -and -not $SkipProxyCheck) {
+ }
+ 
+ $refused = $null
+-if (-not $portLive) {
++if (-not $SkipSystemProxy -and -not $Force -and
++    (($currentAutoConfig -ne '') -or ($currentAutoDetect -ne 0) -or (-not $proxyClassification.SafeToReplace))) {
++    $refused = 'The current Windows proxy uses PAC/WPAD, per-protocol, or custom routing. It will not be overwritten implicitly.'
++} elseif (-not $portLive) {
+     $refused = ("Nothing is listening on 127.0.0.1:{0}. " -f $proxyPort)
+     if (-not $SkipSystemProxy) {
+         $refused += 'Pointing the Windows system proxy at a dead port would take this machine offline ' +
+@@ -553,10 +536,10 @@ if (-not $portLive) {
+     } else {
+         $refused += '  Start your proxy client - or its local inbound port changed.'
+     }
+-} elseif (-not $SkipSystemProxy -and $chain -and -not $chain.Ok) {
++} elseif ($chain -and -not $chain.Ok) {
+     $refused = ("127.0.0.1:{0} is listening but traffic through it cannot reach chatgpt.com." -f $proxyPort) +
+-               ' Writing it into the system proxy would break normal browsing too. Fix the proxy chain (node / ' +
+-               'subscription / outbound) first.'
++               ' The requested route is known-bad, including environment-only mode. Fix the proxy chain ' +
++               '(node / subscription / outbound) first.'
+ }
+ 
+ if ($refused -and -not $Force) {
+@@ -578,8 +561,19 @@ if ($refused -and $Force) {
+ }
+ 
+ # ---- backups -------------------------------------------------------------
++$environmentState = [ordered]@{}
++foreach ($name in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')) {
++    $value = [System.Environment]::GetEnvironmentVariable($name, 'User')
++    $environmentState[$name] = New-ExactValueState -Exists ($null -ne $value) -Value $value
++}
++$systemChangeNeeded = (-not $SkipSystemProxy) -and -not ($currentEnable -eq 1 -and $currentServer.Trim() -eq $target)
++$environmentChangeNeeded = $SetEnvironmentVariables -and (
++    [string]$environmentState.HTTP_PROXY.value -ne "http://127.0.0.1:$proxyPort" -or
++    [string]$environmentState.HTTPS_PROXY.value -ne "http://127.0.0.1:$proxyPort" -or
++    [string]$environmentState.NO_PROXY.value -ne '127.0.0.1,localhost,::1')
++$mutationNeeded = $systemChangeNeeded -or $configPlan.Changed -or $environmentChangeNeeded
+ $backupDir = $null
+-if (-not $DryRun) {
++if (-not $DryRun -and $mutationNeeded) {
+     $backupDir = Join-Path $BackupRoot $Stamp
+     New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+ }
+@@ -589,24 +583,75 @@ if ($DryRun) {
+     Write-Item ("would copy {0} -> {1}" -f $ConfigPath, (Join-Path $BackupRoot "$Stamp\config.toml"))
+     Write-Item ("would record system proxy enable={0} server='{1}'" -f $currentEnable, $currentServer)
+ } else {
++    if (-not $mutationNeeded) {
++        Write-Item 'no mutation is required; no backup will be created'
++    } else {
+     Copy-Item -Path $ConfigPath -Destination (Join-Path $backupDir 'config.toml') -Force
+     $state = [pscustomobject]@{
++        schemaVersion   = 2
++        mutationId      = [guid]::NewGuid().ToString('N')
+         createdAt       = (Get-Date -Format 'o')
+         codexHome       = $CodexHome
+-        proxyEnable     = $currentEnable
+-        proxyServer     = $currentServer
++        configPath      = $ConfigPath
++        configExisted   = $true
++        proxyEnable     = New-ExactValueState -Exists $enableExists -Value $currentEnable
++        proxyServer     = New-ExactValueState -Exists $serverExists -Value $currentServer
++        autoConfigUrl   = New-ExactValueState -Exists $autoConfigExists -Value $currentAutoConfig
++        autoDetect      = New-ExactValueState -Exists $autoDetectExists -Value $currentAutoDetect
+         proxyPortUsed   = $proxyPort
+-        envVarsSet      = [bool]$SetEnvironmentVariables
++        environment     = $environmentState
++        requested       = [pscustomobject]@{ systemProxy = (-not $SkipSystemProxy); environment = [bool]$SetEnvironmentVariables }
++        completedMutations = @()
++        completed       = $false
+     }
+     [System.IO.File]::WriteAllText(
+         (Join-Path $backupDir 'state.json'),
+-        ($state | ConvertTo-Json -Depth 3),
++        ($state | ConvertTo-Json -Depth 8),
+         $Utf8NoBom)
+     Write-Item ("config.toml  -> {0}" -f (Join-Path $backupDir 'config.toml'))
+     Write-Item ("state.json   -> {0}" -f (Join-Path $backupDir 'state.json'))
+     $script:Changes.Add("backup created at $backupDir")
++    }
++}
++
++function Save-TransactionState {
++    if (-not $backupDir) { return }
++    [System.IO.File]::WriteAllText((Join-Path $backupDir 'state.json'), ($state | ConvertTo-Json -Depth 8), $Utf8NoBom)
++}
++
++function Restore-ExactRegistryValue {
++    param([string]$Name, [object]$Saved, [string]$Type)
++    if ($Saved.exists) {
++        Set-ItemProperty -Path $RegPath -Name $Name -Value $Saved.value -Type $Type -ErrorAction Stop
++    } else {
++        Remove-ItemProperty -Path $RegPath -Name $Name -ErrorAction SilentlyContinue
++    }
++}
++
++function Invoke-CompensatingRollback {
++    $unrecovered = New-Object System.Collections.Generic.List[string]
++    foreach ($mutation in (Get-ReversedMutationList -Mutations @($state.completedMutations))) {
++        try {
++            switch ($mutation) {
++                'environment' {
++                    foreach ($name in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')) {
++                        $saved = $state.environment[$name]
++                        [System.Environment]::SetEnvironmentVariable($name, $(if ($saved.exists) { [string]$saved.value } else { $null }), 'User')
++                    }
++                }
++                'config' { Copy-Item -LiteralPath (Join-Path $backupDir 'config.toml') -Destination $ConfigPath -Force }
++                'systemProxy' {
++                    Restore-ExactRegistryValue -Name 'ProxyEnable' -Saved $state.proxyEnable -Type DWord
++                    Restore-ExactRegistryValue -Name 'ProxyServer' -Saved $state.proxyServer -Type String
++                }
++            }
++        } catch { $unrecovered.Add(("{0}: {1}" -f $mutation, $_.Exception.Message)) }
++    }
++    return $unrecovered
+ }
+ 
++try {
++
+ # ---- step 2: system proxy ------------------------------------------------
+ Write-Head 'Step 2/3  Restore the Windows system proxy'
+ if ($SkipSystemProxy) {
+@@ -618,6 +663,8 @@ if ($SkipSystemProxy) {
+         Write-Item ("would set ProxyEnable=1  ProxyServer='{0}'  (was enable={1} server='{2}')" -f $target, $currentEnable, $currentServer)
+     } else {
+         try {
++            $state.completedMutations += 'systemProxy'
++            Save-TransactionState
+             Set-ItemProperty -Path $RegPath -Name ProxyEnable -Value 1      -Type DWord  -ErrorAction Stop
+             Set-ItemProperty -Path $RegPath -Name ProxyServer -Value $target -Type String -ErrorAction Stop
+             $check = Get-ItemProperty -Path $RegPath
+@@ -625,12 +672,10 @@ if ($SkipSystemProxy) {
+                 Write-Item ("FIXED: enable={0} server='{1}'  ->  enable=1 server='{2}'" -f $currentEnable, $currentServer, $target)
+                 $script:Changes.Add("system proxy restored to $target (was enable=$currentEnable server='$currentServer')")
+             } else {
+-                Write-Item 'ERROR: the registry did not keep the new values'
+-                exit 3
++                throw 'the registry did not keep the new values'
+             }
+         } catch {
+-            Write-Host ('   ERROR: registry write failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+-            exit 3
++            throw ('registry write failed: {0}' -f $_.Exception.Message)
+         }
+     }
+ }
+@@ -638,22 +683,20 @@ if ($SkipSystemProxy) {
+ # ---- step 3: config.toml -------------------------------------------------
+ Write-Head 'Step 3/3  Enable [features] respect_system_proxy in config.toml'
+ if ($DryRun) {
+-    $raw = [System.IO.File]::ReadAllText($ConfigPath)
+-    if ($raw -match '(?m)^\s*respect_system_proxy\s*=\s*true\s*$') {
+-        Write-Item 'already set to true - nothing to change'
+-    } else {
+-        Write-Item 'would set respect_system_proxy = true under [features]'
+-    }
++    Write-Item $(if ($configPlan.Changed) { 'would set respect_system_proxy = true under [features]' } else { $configPlan.Description })
+ } else {
+     try {
+-        $description = Set-RespectSystemProxyFeature -Path $ConfigPath
++        if ($configPlan.Changed) {
++            $state.completedMutations += 'config'
++            Save-TransactionState
++        }
++        $description = if ($configPlan.Changed) { Set-RespectSystemProxyFeature -Path $ConfigPath } else { $configPlan.Description }
+         Write-Item $description
+         if ($description -notlike 'already*') {
+             $script:Changes.Add("config.toml: $description")
+         }
+     } catch {
+-        Write-Host ('   ERROR: could not edit config.toml: {0}' -f $_.Exception.Message) -ForegroundColor Red
+-        exit 3
++        throw ('could not edit config.toml: {0}' -f $_.Exception.Message)
+     }
+ }
+ 
+@@ -668,6 +711,15 @@ if ($SetEnvironmentVariables) {
+         if ($DryRun) {
+             Write-Item ("would set {0}={1}" -f $pair.Name, $pair.Value)
+         } else {
++            $savedEnvironmentValue = $environmentState[$pair.Name]
++            if ($savedEnvironmentValue.exists -and [string]$savedEnvironmentValue.value -eq $pair.Value) {
++                Write-Item ("{0} already has the requested value" -f $pair.Name)
++                continue
++            }
++            if ($environmentChangeNeeded -and -not (@($state.completedMutations) -contains 'environment')) {
++                $state.completedMutations += 'environment'
++                Save-TransactionState
++            }
+             [System.Environment]::SetEnvironmentVariable($pair.Name, $pair.Value, 'User')
+             Write-Item ("{0}={1}" -f $pair.Name, $pair.Value)
+         }
+@@ -678,6 +730,19 @@ if ($SetEnvironmentVariables) {
+     }
+ }
+ 
++if (-not $DryRun -and $mutationNeeded) { $state.completed = $true; Save-TransactionState }
++} catch {
++    Write-Host ('   ERROR: {0}' -f $_.Exception.Message) -ForegroundColor Red
++    $unrecovered = @(Invoke-CompensatingRollback)
++    if ($unrecovered.Count -eq 0) {
++        Write-Host '   All earlier mutations from this run were restored.'
++    } else {
++        Write-Host '   WARNING: these surfaces could not be restored:' -ForegroundColor Red
++        foreach ($failure in $unrecovered) { Write-Host ('     * {0}' -f $failure) }
++    }
++    exit 3
++}
++
+ # ---- summary -------------------------------------------------------------
+ Write-Host ''
+ Write-Host '-------------------------------------------------------------'
+diff --git a/scripts/Rollback-CodexReconnect.ps1 b/scripts/Rollback-CodexReconnect.ps1
+index f5d9d19..1d5ffa2 100644
+--- a/scripts/Rollback-CodexReconnect.ps1
++++ b/scripts/Rollback-CodexReconnect.ps1
+@@ -1,53 +1,50 @@
+ #Requires -Version 5.1
+-<#
+-.SYNOPSIS
+-    Undo everything Fix-CodexReconnect.ps1 changed.
+-
+-.DESCRIPTION
+-    Restores config.toml and the Windows system proxy from a backup folder created by
+-    Fix-CodexReconnect.ps1 (<CodexHome>\reconnect-fix-backups\<timestamp>\).
+-    When the backup recorded that user environment variables were set, they are removed
+-    again so the machine returns to its exact previous state.
+-
+-.PARAMETER Backup
+-    Path of the backup folder. When omitted the most recent one is used.
+-
+-.PARAMETER CodexHome
+-    Codex home directory. Default: %USERPROFILE%\.codex
+-
+-.PARAMETER KeepSystemProxy
+-    Restore config.toml but leave the Windows system proxy as it is now.
+-
+-.PARAMETER DryRun
+-    Print what would be restored, write nothing.
+-
+-.EXAMPLE
+-    .\Rollback-CodexReconnect.ps1 -DryRun
+-    .\Rollback-CodexReconnect.ps1
+-
+-.NOTES
+-    Windows PowerShell 5.1 and PowerShell 7+. No admin rights required.
+-    Exit code: 0 = restored, 1 = no backup found, 3 = restore failed.
+-    Author: cg689  |  https://github.com/cg689/codex-reconnect-fix
+-#>
+ 
+ [CmdletBinding()]
+ param(
+     [string]$Backup,
+-    [string]$CodexHome = (Join-Path $env:USERPROFILE '.codex'),
++    [string]$CodexHome,
+     [switch]$KeepSystemProxy,
+     [switch]$DryRun
+ )
+ 
+ $ErrorActionPreference = 'Stop'
++. (Join-Path $PSScriptRoot 'CodexReconnect.Common.ps1')
++
++try { $CodexHome = Resolve-CodexReconnectHome -RequestedHome $CodexHome } catch {
++    Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
++    exit 1
++}
+ 
+-$RegPath    = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
++$RegPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+ $BackupRoot = Join-Path $CodexHome 'reconnect-fix-backups'
+-$Utf8NoBom  = New-Object System.Text.UTF8Encoding($false)
++$environmentNames = @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')
+ 
+-function Write-Item {
+-    param([string]$Text)
+-    Write-Host ('    {0}' -f $Text)
++function Write-Item { param([string]$Text) Write-Host ('    {0}' -f $Text) }
++
++function Read-BackupState {
++    param([string]$Path)
++    $statePath = Join-Path $Path 'state.json'
++    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) { return $null }
++    try { return (Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
++}
++
++function Resolve-BackupFolder {
++    if ($Backup) {
++        $resolved = [System.IO.Path]::GetFullPath($Backup)
++        if (-not (Test-Path -LiteralPath $resolved -PathType Container)) { throw "backup folder not found: $resolved" }
++        return $resolved
++    }
++    if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) { throw "no backup folder found at $BackupRoot" }
++    $selected = Find-LatestValidMutationBackup -Root $BackupRoot
++    if ($selected) { return $selected }
++    throw 'no valid mutation backup was found; empty, partial, and malformed folders were ignored'
++}
++
++function Restore-RegistryValue {
++    param([string]$Name, $Entry, [string]$Type)
++    if ([bool]$Entry.exists) { Set-ItemProperty -Path $RegPath -Name $Name -Value $Entry.value -Type $Type -ErrorAction Stop }
++    else { Remove-ItemProperty -Path $RegPath -Name $Name -ErrorAction SilentlyContinue }
+ }
+ 
+ Write-Host '============================================================='
+@@ -56,95 +53,127 @@ if ($DryRun) { Write-Host ' MODE: dry run - nothing will be written' }
+ Write-Host '============================================================='
+ Write-Host ''
+ 
+-# ---- locate the backup ---------------------------------------------------
+-if (-not $Backup) {
+-    if (-not (Test-Path $BackupRoot)) {
+-        Write-Host ("ERROR: no backup folder found at {0}" -f $BackupRoot) -ForegroundColor Red
+-        Write-Host 'Run Fix-CodexReconnect.ps1 first, or pass -Backup <path>.'
++try { $Backup = Resolve-BackupFolder } catch {
++    Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
++    exit 1
++}
++
++$state = Read-BackupState -Path $Backup
++$validation = Test-BackupState -State $state -BackupPath $Backup
++if (-not $validation.Valid) {
++    Write-Host ("ERROR: backup state is not safe to restore: {0}" -f $validation.Reason) -ForegroundColor Red
++    exit 1
++}
++
++$backupConfig = Join-Path $Backup 'config.toml'
++$targetConfig = Join-Path $CodexHome 'config.toml'
++if (-not $validation.Legacy) {
++    $recordedHome = [System.IO.Path]::GetFullPath([string]$state.codexHome)
++    $recordedConfig = [System.IO.Path]::GetFullPath([string]$state.configPath)
++    if ($recordedConfig -ne (Join-Path $recordedHome 'config.toml')) {
++        Write-Host 'ERROR: backup configPath does not match its recorded Codex home.' -ForegroundColor Red
+         exit 1
+     }
+-    $latest = Get-ChildItem -Path $BackupRoot -Directory |
+-              Sort-Object Name -Descending | Select-Object -First 1
+-    if (-not $latest) {
+-        Write-Host ("ERROR: {0} exists but contains no backup folders." -f $BackupRoot) -ForegroundColor Red
++    if ($recordedHome -ne [System.IO.Path]::GetFullPath($CodexHome)) {
++        Write-Host ("ERROR: backup belongs to a different Codex home: {0}" -f $recordedHome) -ForegroundColor Red
+         exit 1
+     }
+-    $Backup = $latest.FullName
++    $targetConfig = $recordedConfig
+ }
++Write-Host ("Using backup: {0}" -f $Backup)
++if ($validation.Legacy) { Write-Host 'WARNING: legacy backup; exact environment restoration is unavailable.' -ForegroundColor Yellow }
+ 
+-if (-not (Test-Path $Backup)) {
+-    Write-Host ("ERROR: backup folder not found: {0}" -f $Backup) -ForegroundColor Red
++$mutations = if ($validation.Legacy) { @('config', 'systemProxy') } else { @($state.completedMutations) }
++$restoreConfig = $mutations -contains 'config'
++$restoreSystemProxy = (-not $KeepSystemProxy) -and ($mutations -contains 'systemProxy')
++$restoreEnvironment = (-not $validation.Legacy) -and ($mutations -contains 'environment')
++
++if ($restoreConfig -and -not (Test-Path -LiteralPath $backupConfig -PathType Leaf)) {
++    Write-Host 'ERROR: config.toml backup is required but missing; nothing was restored.' -ForegroundColor Red
+     exit 1
+ }
+ 
+-$backupConfig = Join-Path $Backup 'config.toml'
+-$stateFile    = Join-Path $Backup 'state.json'
+-
+-Write-Host ("Using backup: {0}" -f $Backup)
+ Write-Host ''
++Write-Host 'Restore plan'
++Write-Item $(if ($restoreConfig) { 'config.toml: exact prior bytes' } else { 'config.toml: not changed by this Fix; skipped' })
++Write-Item $(if ($restoreSystemProxy) { 'Windows proxy: exact prior existence and values' } elseif ($KeepSystemProxy) { 'Windows proxy: skipped (-KeepSystemProxy)' } else { 'Windows proxy: not changed by this Fix; skipped' })
++Write-Item $(if ($restoreEnvironment) { 'user environment: exact prior existence and values' } else { 'user environment: not changed by this Fix; skipped' })
+ 
+-$state = $null
+-if (Test-Path $stateFile) {
+-    try { $state = Get-Content $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
++if ($DryRun) {
++    Write-Host ''
++    Write-Host '-------------------------------------------------------------'
++    Write-Host 'Dry run finished. No state was changed.'
++    Write-Host '-------------------------------------------------------------'
++    exit 0
+ }
+ 
+-# ---- restore config.toml -------------------------------------------------
+-Write-Host 'Step 1/2  Restore config.toml'
+-$targetConfig = Join-Path $CodexHome 'config.toml'
+-if (-not (Test-Path $backupConfig)) {
+-    Write-Item 'no config.toml in this backup - skipped'
+-} elseif ($DryRun) {
+-    Write-Item ("would copy {0} -> {1}" -f $backupConfig, $targetConfig)
+-} else {
+-    if (Test-Path $targetConfig) {
+-        Copy-Item -Path $targetConfig -Destination ($targetConfig + '.before-rollback') -Force
+-        Write-Item ("current file kept as {0}.before-rollback" -f (Split-Path $targetConfig -Leaf))
+-    }
+-    Copy-Item -Path $backupConfig -Destination $targetConfig -Force
+-    Write-Item 'restored'
++$operations = New-Object System.Collections.Generic.List[object]
++if ($restoreConfig) {
++    $backupConfigBytes = [System.IO.File]::ReadAllBytes($backupConfig)
++    $currentConfigExists = Test-Path -LiteralPath $targetConfig -PathType Leaf
++    $currentConfigBytes = if ($currentConfigExists) { [System.IO.File]::ReadAllBytes($targetConfig) } else { $null }
++    $operations.Add([pscustomobject]@{
++        Name = 'config'
++        Apply = { Write-AtomicBytes -Path $targetConfig -Bytes $backupConfigBytes }.GetNewClosure()
++        Rollback = {
++            if ($currentConfigExists) { Write-AtomicBytes -Path $targetConfig -Bytes $currentConfigBytes }
++            else { Remove-Item -LiteralPath $targetConfig -Force -ErrorAction SilentlyContinue }
++        }.GetNewClosure()
++    })
+ }
+ 
+-# ---- restore the system proxy -------------------------------------------
+-Write-Host ''
+-Write-Host 'Step 2/2  Restore the Windows system proxy'
+-if ($KeepSystemProxy) {
+-    Write-Item 'skipped (-KeepSystemProxy)'
+-} elseif (-not $state) {
+-    Write-Item 'no state.json in this backup - the system proxy is left untouched'
+-} elseif ($DryRun) {
+-    Write-Item ("would set ProxyEnable={0} ProxyServer='{1}'" -f [int]$state.proxyEnable, [string]$state.proxyServer)
+-} else {
+-    try {
+-        Set-ItemProperty -Path $RegPath -Name ProxyEnable -Value ([int]$state.proxyEnable) -Type DWord  -ErrorAction Stop
+-        Set-ItemProperty -Path $RegPath -Name ProxyServer -Value ([string]$state.proxyServer) -Type String -ErrorAction Stop
+-        Write-Item ("restored: ProxyEnable={0} ProxyServer='{1}'" -f [int]$state.proxyEnable, [string]$state.proxyServer)
+-    } catch {
+-        Write-Host ('    ERROR: registry write failed: {0}' -f $_.Exception.Message) -ForegroundColor Red
+-        exit 3
++if ($restoreSystemProxy) {
++    $currentProps = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
++    $currentRegistry = @{}
++    foreach ($name in @('ProxyEnable', 'ProxyServer', 'AutoConfigURL', 'AutoDetect')) {
++        $exists = [bool]($currentProps -and $currentProps.PSObject.Properties[$name])
++        $currentRegistry[$name] = New-ExactValueState -Exists $exists -Value $(if ($exists) { $currentProps.$name } else { $null })
+     }
++    $operations.Add([pscustomobject]@{
++        Name = 'systemProxy'
++        Apply = {
++            if ($validation.Legacy) {
++                Set-ItemProperty -Path $RegPath -Name ProxyEnable -Value ([int]$state.proxyEnable) -Type DWord -ErrorAction Stop
++                Set-ItemProperty -Path $RegPath -Name ProxyServer -Value ([string]$state.proxyServer) -Type String -ErrorAction Stop
++            } else {
++                Restore-RegistryValue -Name 'ProxyEnable' -Entry $state.proxyEnable -Type DWord
++                Restore-RegistryValue -Name 'ProxyServer' -Entry $state.proxyServer -Type String
++                Restore-RegistryValue -Name 'AutoConfigURL' -Entry $state.autoConfigUrl -Type String
++                Restore-RegistryValue -Name 'AutoDetect' -Entry $state.autoDetect -Type DWord
++            }
++        }.GetNewClosure()
++        Rollback = {
++            Restore-RegistryValue -Name 'ProxyEnable' -Entry $currentRegistry.ProxyEnable -Type DWord
++            Restore-RegistryValue -Name 'ProxyServer' -Entry $currentRegistry.ProxyServer -Type String
++            Restore-RegistryValue -Name 'AutoConfigURL' -Entry $currentRegistry.AutoConfigURL -Type String
++            Restore-RegistryValue -Name 'AutoDetect' -Entry $currentRegistry.AutoDetect -Type DWord
++        }.GetNewClosure()
++    })
+ }
+ 
+-# ---- remove user environment variables ----------------------------------
+-if ($state -and $state.envVarsSet) {
+-    Write-Host ''
+-    Write-Host 'Extra  Remove the user environment variables that were added'
+-    foreach ($name in @('HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY')) {
+-        if ($DryRun) {
+-            Write-Item ("would clear {0}" -f $name)
+-        } else {
+-            [System.Environment]::SetEnvironmentVariable($name, $null, 'User')
+-            Write-Item ("cleared {0}" -f $name)
+-        }
+-    }
++if ($restoreEnvironment) {
++    $currentEnvironment = Get-UserEnvironmentSnapshot -Names $environmentNames
++    $operations.Add([pscustomobject]@{
++        Name = 'environment'
++        Apply = { Restore-UserEnvironmentSnapshot -Snapshot $state.environment -Names $environmentNames }.GetNewClosure()
++        Rollback = { Restore-UserEnvironmentSnapshot -Snapshot $currentEnvironment -Names $environmentNames }.GetNewClosure()
++    })
+ }
+ 
++$result = Invoke-RecoverableTransaction -Operations $operations -OnCompleted { param($name) Write-Item ("restored {0}" -f $name) }
++
+ Write-Host ''
+ Write-Host '-------------------------------------------------------------'
+-if ($DryRun) {
+-    Write-Host 'Dry run finished. Re-run without -DryRun to restore.'
+-} else {
+-    Write-Host 'Rollback complete. Restart the Codex / ChatGPT desktop app.'
++if (-not $result.Succeeded) {
++    Write-Host ("Rollback failed: {0}" -f $result.Error.Exception.Message) -ForegroundColor Red
++    if (@($result.Unrecovered).Count -eq 0) { Write-Host 'Earlier restore steps were compensated back to their pre-rollback state.' }
++    else {
++        Write-Host 'These compensated surfaces could not be returned to their pre-rollback state:' -ForegroundColor Red
++        foreach ($failure in $result.Unrecovered) { Write-Host ('  * {0}' -f $failure) }
++    }
++    Write-Host '-------------------------------------------------------------'
++    exit 3
+ }
++Write-Host 'Rollback complete. Restart the Codex / ChatGPT desktop app.'
+ Write-Host '-------------------------------------------------------------'
+-
+ exit 0
+
+--- /dev/null
++++ b/scripts/CodexReconnect.Common.ps1
+#Requires -Version 5.1
+
+$script:CodexReconnectUtf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+function Get-DefaultCodexHome {
+    if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
+        return [System.IO.Path]::GetFullPath($env:CODEX_HOME)
+    }
+    if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        throw 'Neither CODEX_HOME nor USERPROFILE is available.'
+    }
+    return (Join-Path $env:USERPROFILE '.codex')
+}
+
+function Resolve-CodexReconnectHome {
+    param([AllowNull()][string]$RequestedHome)
+    if ([string]::IsNullOrWhiteSpace($RequestedHome)) { return (Get-DefaultCodexHome) }
+    return [System.IO.Path]::GetFullPath([System.Environment]::ExpandEnvironmentVariables($RequestedHome))
+}
+
+function Assert-CodexReconnectParameters {
+    param([int]$Port, [int]$TimeoutSec, [string]$TimeoutName = 'TimeoutSec')
+    if ($Port -lt 0 -or $Port -gt 65535) { throw '-Port must be between 0 and 65535.' }
+    if ($TimeoutSec -lt 1 -or $TimeoutSec -gt 300) { throw ("-{0} must be between 1 and 300 seconds." -f $TimeoutName) }
+}
+
+function Protect-SensitiveText {
+    param([AllowNull()][string]$Text)
+    if ($null -eq $Text) { return $null }
+
+    $redacted = [regex]::Replace(
+        $Text,
+        '(?i)\b(?<scheme>https?|socks4a?|socks5h?)://(?<userinfo>[^\s/@]+(?::[^\s/@]*)?)@',
+        '${scheme}://[REDACTED]@')
+    $redacted = [regex]::Replace(
+        $redacted,
+        '(?i)(?<name>password|passwd|token|secret|api[_-]?key)=(?<value>[^\s;&]+)',
+        '${name}=[REDACTED]')
+    $redacted = [regex]::Replace(
+        $redacted,
+        '(?i)(?<base>\b(?:https?|socks4a?|socks5h?)://[^\s?#]+)\?[^\s#]*',
+        '${base}?[REDACTED]')
+    return $redacted
+}
+
+function Get-CommentIndex {
+    param([string]$Text)
+    $quote = [char]0
+    $escaped = $false
+    for ($index = 0; $index -lt $Text.Length; $index++) {
+        $character = $Text[$index]
+        if ($escaped) { $escaped = $false; continue }
+        if ($quote -eq '"' -and $character -eq '\') { $escaped = $true; continue }
+        if ($quote -ne [char]0) {
+            if ($character -eq $quote) { $quote = [char]0 }
+            continue
+        }
+        if ($character -eq '"' -or $character -eq "'") { $quote = $character; continue }
+        if ($character -eq '#') { return $index }
+    }
+    if ($quote -ne [char]0) { throw 'Unterminated quoted string.' }
+    return -1
+}
+
+function Split-TomlAssignment {
+    param([string]$Text)
+    $quote = [char]0
+    $escaped = $false
+    for ($index = 0; $index -lt $Text.Length; $index++) {
+        $character = $Text[$index]
+        if ($escaped) { $escaped = $false; continue }
+        if ($quote -eq '"' -and $character -eq '\') { $escaped = $true; continue }
+        if ($quote -ne [char]0) {
+            if ($character -eq $quote) { $quote = [char]0 }
+            continue
+        }
+        if ($character -eq '"' -or $character -eq "'") { $quote = $character; continue }
+        if ($character -eq '=') {
+            return [pscustomobject]@{
+                Key = $Text.Substring(0, $index).Trim()
+                Value = $Text.Substring($index + 1).Trim()
+            }
+        }
+    }
+    if ($quote -ne [char]0) { throw 'Unterminated quoted key.' }
+    return $null
+}
+
+function ConvertFrom-TomlKeyPart {
+    param([string]$Text)
+    $value = $Text.Trim()
+    if ($value.Length -ge 2 -and (($value[0] -eq '"' -and $value[$value.Length - 1] -eq '"') -or
+                                  ($value[0] -eq "'" -and $value[$value.Length - 1] -eq "'"))) {
+        return $value.Substring(1, $value.Length - 2)
+    }
+    if ($value -notmatch '^[A-Za-z0-9_-]+$') { throw "Unsupported or ambiguous TOML key: $Text" }
+    return $value
+}
+
+function Get-TomlLogicalKey {
+    param([string]$Text)
+    $parts = New-Object System.Collections.Generic.List[string]
+    $start = 0
+    $quote = [char]0
+    $escaped = $false
+    for ($index = 0; $index -lt $Text.Length; $index++) {
+        $character = $Text[$index]
+        if ($escaped) { $escaped = $false; continue }
+        if ($quote -eq '"' -and $character -eq '\') { $escaped = $true; continue }
+        if ($quote -ne [char]0) {
+            if ($character -eq $quote) { $quote = [char]0 }
+            continue
+        }
+        if ($character -eq '"' -or $character -eq "'") { $quote = $character; continue }
+        if ($character -eq '.') {
+            $parts.Add((ConvertFrom-TomlKeyPart $Text.Substring($start, $index - $start)))
+            $start = $index + 1
+        }
+    }
+    if ($quote -ne [char]0) { throw 'Unterminated quoted key.' }
+    $parts.Add((ConvertFrom-TomlKeyPart $Text.Substring($start)))
+    return ($parts -join '.')
+}
+
+function Get-RespectSystemProxyPlan {
+    param([Parameter(Mandatory = $true)][string]$Text)
+
+    if ($Text.IndexOf([char]0) -ge 0) { throw 'config.toml contains a NUL byte.' }
+    $eol = if ($Text -match "`r`n") { "`r`n" } else { "`n" }
+    $hadTrailingNewline = $Text -match '(\r?\n)$'
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($Text -split '\r?\n')) { $lines.Add($line) }
+    if ($hadTrailingNewline -and $lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') {
+        $lines.RemoveAt($lines.Count - 1)
+    }
+
+    $featureHeaders = New-Object System.Collections.Generic.List[int]
+    $logicalKeys = New-Object System.Collections.Generic.List[object]
+    $currentTable = ''
+
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        $raw = $lines[$index]
+        $commentIndex = Get-CommentIndex $raw
+        $code = if ($commentIndex -ge 0) { $raw.Substring(0, $commentIndex).Trim() } else { $raw.Trim() }
+        if ($code -eq '') { continue }
+
+        if ($code.StartsWith('[[')) {
+            if (-not $code.EndsWith(']]')) { throw "Malformed TOML array table header near line $($index + 1)." }
+            $currentTable = '__array_table__'
+            continue
+        }
+        if ($code.StartsWith('[')) {
+            if (-not $code.EndsWith(']')) { throw "Malformed TOML table header near line $($index + 1)." }
+            $currentTable = Get-TomlLogicalKey $code.Substring(1, $code.Length - 2)
+            if ($currentTable -eq 'features') { $featureHeaders.Add($index) }
+            continue
+        }
+
+        $assignment = Split-TomlAssignment $code
+        if (-not $assignment) { continue }
+        $key = Get-TomlLogicalKey $assignment.Key
+        $logical = if ($currentTable) { "$currentTable.$key" } else { $key }
+        if ($logical -eq 'features.respect_system_proxy') {
+            $logicalKeys.Add([pscustomobject]@{ Line = $index; KeyText = $assignment.Key; Table = $currentTable })
+        }
+    }
+
+    if ($featureHeaders.Count -gt 1) { throw 'config.toml contains duplicate [features] tables.' }
+    if ($logicalKeys.Count -gt 1) { throw 'config.toml contains duplicate logical respect_system_proxy keys.' }
+    if ($featureHeaders.Count -eq 1 -and $logicalKeys.Count -eq 1 -and [string]::IsNullOrEmpty($logicalKeys[0].Table)) {
+        throw 'config.toml mixes a dotted features key with an explicit [features] table.'
+    }
+
+    $description = ''
+    if ($logicalKeys.Count -eq 1) {
+        $lineIndex = $logicalKeys[0].Line
+        $raw = $lines[$lineIndex]
+        $commentIndex = Get-CommentIndex $raw
+        $comment = if ($commentIndex -ge 0) { $raw.Substring($commentIndex) } else { '' }
+        $code = if ($commentIndex -ge 0) { $raw.Substring(0, $commentIndex) } else { $raw }
+        $assignment = Split-TomlAssignment $code
+        $prefix = $code.Substring(0, $code.IndexOf('=') + 1)
+        if ($assignment.Value.Trim() -notmatch '^(?i:true|false)$') {
+            throw 'respect_system_proxy must be a TOML boolean before it can be changed safely.'
+        }
+        $replacement = $prefix + ' true'
+        if ($comment) { $replacement += ' ' + $comment.TrimStart() }
+        if ($raw -eq $replacement) {
+            return [pscustomobject]@{ Changed = $false; Text = $Text; Description = 'already set to true' }
+        }
+        $lines[$lineIndex] = $replacement
+        $description = 'updated the existing logical respect_system_proxy key'
+    } elseif ($featureHeaders.Count -eq 1) {
+        $lines.Insert($featureHeaders[0] + 1, 'respect_system_proxy = true')
+        $description = 'inserted respect_system_proxy into the existing [features] table'
+    } else {
+        if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -ne '') { $lines.Add('') }
+        $lines.Add('[features]')
+        $lines.Add('respect_system_proxy = true')
+        $description = 'appended a new [features] table'
+    }
+
+    $result = $lines -join $eol
+    if ($hadTrailingNewline) { $result += $eol }
+    return [pscustomobject]@{ Changed = $true; Text = $result; Description = $description }
+}
+
+function Get-RespectSystemProxyValue {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    $plan = Get-RespectSystemProxyPlan -Text $Text
+    if ($plan.Changed) {
+        $hasExistingKey = $plan.Description -like 'updated*'
+        if (-not $hasExistingKey) { return $null }
+    }
+
+    $lines = $Text -split '\r?\n'
+    $currentTable = ''
+    $values = @()
+    foreach ($raw in $lines) {
+        $commentIndex = Get-CommentIndex $raw
+        $code = if ($commentIndex -ge 0) { $raw.Substring(0, $commentIndex).Trim() } else { $raw.Trim() }
+        if (-not $code) { continue }
+        if ($code.StartsWith('[')) {
+            if ($code.StartsWith('[[')) {
+                if (-not $code.EndsWith(']]')) { throw 'Malformed TOML array table header.' }
+                $currentTable = '__array_table__'
+                continue
+            }
+            if (-not $code.EndsWith(']')) { throw 'Malformed TOML table header.' }
+            $currentTable = Get-TomlLogicalKey $code.Substring(1, $code.Length - 2)
+            continue
+        }
+        $assignment = Split-TomlAssignment $code
+        if (-not $assignment) { continue }
+        $key = Get-TomlLogicalKey $assignment.Key
+        $logical = if ($currentTable) { "$currentTable.$key" } else { $key }
+        if ($logical -eq 'features.respect_system_proxy') { $values += $assignment.Value.Trim() }
+    }
+    if ($values.Count -eq 0) { return $null }
+    if ($values.Count -gt 1) { throw 'Duplicate logical respect_system_proxy keys.' }
+    return $values[0]
+}
+
+function Test-TomlTrue {
+    param([AllowNull()][string]$Value)
+    return ($null -ne $Value -and $Value.Trim().ToLowerInvariant() -eq 'true')
+}
+
+function Write-AtomicTextFile {
+    param([string]$Path, [string]$Text)
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $directory = Split-Path $fullPath -Parent
+    $temporary = Join-Path $directory ('.codex-reconnect-{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+    try {
+        [System.IO.File]::WriteAllText($temporary, $Text, $script:CodexReconnectUtf8NoBom)
+        if (Test-Path -LiteralPath $fullPath) {
+            [System.IO.File]::Replace($temporary, $fullPath, $null)
+        } else {
+            [System.IO.File]::Move($temporary, $fullPath)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Write-AtomicBytes {
+    param([string]$Path, [byte[]]$Bytes)
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $directory = Split-Path $fullPath -Parent
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+    $temporary = Join-Path $directory ('.codex-reconnect-{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+    try {
+        [System.IO.File]::WriteAllBytes($temporary, $Bytes)
+        if (Test-Path -LiteralPath $fullPath) { [System.IO.File]::Replace($temporary, $fullPath, $null) }
+        else { [System.IO.File]::Move($temporary, $fullPath) }
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Invoke-RecoverableTransaction {
+    param([object[]]$Operations, [scriptblock]$OnCompleted)
+    $completed = New-Object System.Collections.Generic.List[object]
+    try {
+        foreach ($operation in $Operations) {
+            $completed.Add($operation)
+            & $operation.Apply
+            if ($OnCompleted) { & $OnCompleted $operation.Name }
+        }
+        return [pscustomobject]@{ Succeeded = $true; Unrecovered = @(); Error = $null }
+    } catch {
+        $originalError = $_
+        $unrecovered = New-Object System.Collections.Generic.List[string]
+        for ($index = $completed.Count - 1; $index -ge 0; $index--) {
+            try { & $completed[$index].Rollback } catch { $unrecovered.Add([string]$completed[$index].Name) }
+        }
+        return [pscustomobject]@{ Succeeded = $false; Unrecovered = @($unrecovered); Error = $originalError }
+    }
+}
+
+function Get-UserEnvironmentSnapshot {
+    param([string[]]$Names)
+    $result = [ordered]@{}
+    foreach ($name in $Names) {
+        $value = [System.Environment]::GetEnvironmentVariable($name, 'User')
+        $result[$name] = [ordered]@{ Exists = ($null -ne $value); Value = $value }
+    }
+    return $result
+}
+
+function New-ExactValueState {
+    param([bool]$Exists, [AllowNull()][object]$Value)
+    return [pscustomobject]@{ exists = $Exists; value = $Value }
+}
+
+function Get-ReversedMutationList {
+    param([object[]]$Mutations)
+    $result = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Mutations) { return $result.ToArray() }
+    for ($index = $Mutations.Count - 1; $index -ge 0; $index--) { $result.Add($Mutations[$index]) }
+    return $result.ToArray()
+}
+
+function Restore-UserEnvironmentSnapshot {
+    param($Snapshot, [string[]]$Names)
+    foreach ($entry in (Get-EnvironmentRestorePlan -Snapshot $Snapshot -Names $Names)) {
+        [System.Environment]::SetEnvironmentVariable($entry.Name, $entry.Value, 'User')
+    }
+}
+
+function Get-EnvironmentRestorePlan {
+    param($Snapshot, [string[]]$Names)
+    $result = New-Object System.Collections.Generic.List[object]
+    foreach ($name in $Names) {
+        $entry = $Snapshot.$name
+        if ($null -eq $entry) { throw "Backup is missing environment state for $name." }
+        $result.Add([pscustomobject]@{
+            Name = $name
+            Exists = [bool]$entry.Exists
+            Value = $(if ([bool]$entry.Exists) { [string]$entry.Value } else { $null })
+        })
+    }
+    return $result.ToArray()
+}
+
+function Get-SimpleProxyEndpoint {
+    param([AllowNull()][string]$ProxyServer)
+    if ([string]::IsNullOrWhiteSpace($ProxyServer)) {
+        return [pscustomobject]@{ Supported = $false; Complex = $false; Reason = 'empty'; Uri = $null; Host = $null; Port = 0 }
+    }
+    $value = $ProxyServer.Trim()
+    if ($value.Contains(';') -or $value.Contains('=')) {
+        return [pscustomobject]@{ Supported = $false; Complex = $true; Reason = 'per-protocol proxy mapping'; Uri = $null; Host = $null; Port = 0 }
+    }
+    $candidate = if ($value -match '^[A-Za-z][A-Za-z0-9+.-]*://') { $value } else { "http://$value" }
+    $uri = $null
+    if (-not [uri]::TryCreate($candidate, [System.UriKind]::Absolute, [ref]$uri) -or $uri.Port -le 0) {
+        return [pscustomobject]@{ Supported = $false; Complex = $true; Reason = 'unrecognized proxy address'; Uri = $null; Host = $null; Port = 0 }
+    }
+    return [pscustomobject]@{ Supported = $true; Complex = $false; Reason = ''; Uri = $uri.AbsoluteUri; Host = $uri.Host; Port = $uri.Port; Scheme = $uri.Scheme.ToLowerInvariant() }
+}
+
+function Get-PerProtocolProxyEndpoint {
+    param([AllowNull()][string]$ProxyServer)
+    if ([string]::IsNullOrWhiteSpace($ProxyServer) -or -not $ProxyServer.Contains('=')) { return $null }
+    $mapping = @{}
+    foreach ($part in ($ProxyServer -split ';')) {
+        $assignment = $part -split '=', 2
+        if ($assignment.Count -ne 2) { continue }
+        $mapping[$assignment[0].Trim().ToLowerInvariant()] = $assignment[1].Trim()
+    }
+    $selected = if ($mapping.ContainsKey('https')) { $mapping['https'] } elseif ($mapping.ContainsKey('http')) { $mapping['http'] } else { $null }
+    if (-not $selected) { return $null }
+    return (Get-SimpleProxyEndpoint -ProxyServer $selected)
+}
+
+function Get-EffectiveProxyRoute {
+    param($Environment, [bool]$FeatureEnabled, [int]$ProxyEnable, [AllowNull()][string]$ProxyServer, [AllowNull()][string]$AutoConfigUrl, [int]$AutoDetect)
+    foreach ($name in @('HTTPS_PROXY', 'ALL_PROXY', 'HTTP_PROXY')) {
+        $value = [string]$Environment.$name
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        $endpoint = Get-SimpleProxyEndpoint -ProxyServer $value
+        $verifiable = $endpoint.Supported -and $endpoint.Scheme -in @('http', 'https')
+        return [pscustomobject]@{ Kind = 'environment'; Source = $name; Configured = $true; Verifiable = $verifiable; ProxyUrl = $(if ($endpoint.Supported) { $endpoint.Uri } else { $value }); Host = $endpoint.Host; Port = $endpoint.Port; Reason = $(if ($verifiable) { '' } elseif ($endpoint.Supported) { "proxy scheme '$($endpoint.Scheme)' cannot be verified by this script" } else { $endpoint.Reason }) }
+    }
+    if (-not $FeatureEnabled) { return [pscustomobject]@{ Kind = 'none'; Source = ''; Configured = $false; Verifiable = $false; ProxyUrl = $null; Host = $null; Port = 0; Reason = 'no proxy environment variable is set and respect_system_proxy is not enabled' } }
+    if (-not [string]::IsNullOrWhiteSpace($AutoConfigUrl) -or $AutoDetect -ne 0) { return [pscustomobject]@{ Kind = 'system-auto'; Source = 'Windows PAC/WPAD'; Configured = $true; Verifiable = $false; ProxyUrl = $null; Host = $null; Port = 0; Reason = 'PAC/WPAD routing cannot be proven by a single explicit proxy request' } }
+    if ($ProxyEnable -ne 1) { return [pscustomobject]@{ Kind = 'none'; Source = 'Windows system proxy'; Configured = $false; Verifiable = $false; ProxyUrl = $null; Host = $null; Port = 0; Reason = 'Windows system proxy is disabled' } }
+    $endpoint = if ($ProxyServer -match '=') { Get-PerProtocolProxyEndpoint -ProxyServer $ProxyServer } else { Get-SimpleProxyEndpoint -ProxyServer $ProxyServer }
+    if ($null -eq $endpoint -or -not $endpoint.Supported) { return [pscustomobject]@{ Kind = 'system-complex'; Source = 'Windows system proxy'; Configured = $true; Verifiable = $false; ProxyUrl = $null; Host = $null; Port = 0; Reason = 'the system proxy topology is not safely reducible to one HTTPS proxy endpoint' } }
+    $verifiable = $endpoint.Scheme -in @('http', 'https')
+    return [pscustomobject]@{ Kind = $(if ($ProxyServer -match '=') { 'system-per-protocol' } else { 'system-simple' }); Source = 'Windows system proxy'; Configured = $true; Verifiable = $verifiable; ProxyUrl = $endpoint.Uri; Host = $endpoint.Host; Port = $endpoint.Port; Reason = $(if ($verifiable) { '' } else { "proxy scheme '$($endpoint.Scheme)' cannot be verified by this script" }) }
+}
+
+function Get-ProxyServerClassification {
+    param([AllowNull()][string]$ProxyServer)
+    $endpoint = Get-SimpleProxyEndpoint -ProxyServer $ProxyServer
+    if ($endpoint.Supported -and $endpoint.Host -in @('127.0.0.1', 'localhost', '::1')) {
+        return [pscustomobject]@{ Kind = 'simple-local'; Port = $endpoint.Port; SafeToReplace = $true }
+    }
+    if ([string]::IsNullOrWhiteSpace($ProxyServer)) {
+        return [pscustomobject]@{ Kind = 'none'; Port = 0; SafeToReplace = $true }
+    }
+    return [pscustomobject]@{ Kind = $(if ($endpoint.Complex) { 'complex' } else { 'custom' }); Port = 0; SafeToReplace = $false }
+}
+
+function Get-DiagnoseVerdict {
+    param([bool]$RouteConfigured, [bool]$RequiredProbeRan, [bool]$RequiredProbePassed, [bool]$HasFailure)
+    if ($HasFailure) { return 'PROBLEM' }
+    if (-not $RouteConfigured -or -not $RequiredProbeRan -or -not $RequiredProbePassed) { return 'UNVERIFIED' }
+    return 'OK'
+}
+
+function Test-BackupState {
+    param($State, [string]$BackupPath)
+    if ($null -eq $State) { return [pscustomobject]@{ Valid = $false; Reason = 'state.json is missing or malformed'; Legacy = $false } }
+    if ($State.schemaVersion -eq 2) {
+        if ([string]::IsNullOrWhiteSpace([string]$State.mutationId)) { return [pscustomobject]@{ Valid = $false; Reason = 'mutationId is missing'; Legacy = $false } }
+        if ([string]::IsNullOrWhiteSpace([string]$State.codexHome)) { return [pscustomobject]@{ Valid = $false; Reason = 'codexHome is missing'; Legacy = $false } }
+        if ($null -eq $State.completedMutations) { return [pscustomobject]@{ Valid = $false; Reason = 'completedMutations is missing'; Legacy = $false } }
+        if (-not [bool]$State.completed) { return [pscustomobject]@{ Valid = $false; Reason = 'backup transaction did not complete'; Legacy = $false } }
+        foreach ($name in @('configPath', 'proxyEnable', 'proxyServer', 'autoConfigUrl', 'autoDetect', 'environment')) {
+            if ($null -eq $State.$name) { return [pscustomobject]@{ Valid = $false; Reason = "$name is missing"; Legacy = $false } }
+        }
+        foreach ($name in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')) {
+            if ($null -eq $State.environment.$name) { return [pscustomobject]@{ Valid = $false; Reason = "environment.$name is missing"; Legacy = $false } }
+        }
+        return [pscustomobject]@{ Valid = $true; Reason = ''; Legacy = $false }
+    }
+    if ($null -ne $State.proxyEnable -and $null -ne $State.proxyServer -and $State.codexHome) {
+        if ($State.envVarsSet) { return [pscustomobject]@{ Valid = $false; Reason = 'legacy backup cannot restore previous environment values exactly'; Legacy = $true } }
+        return [pscustomobject]@{ Valid = $true; Reason = ''; Legacy = $true }
+    }
+    return [pscustomobject]@{ Valid = $false; Reason = 'unsupported backup schema'; Legacy = $false }
+}
+
+function Find-LatestValidMutationBackup {
+    param([string]$Root)
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return $null }
+    foreach ($candidate in (Get-ChildItem -LiteralPath $Root -Directory | Sort-Object LastWriteTimeUtc -Descending)) {
+        $statePath = Join-Path $candidate.FullName 'state.json'
+        if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) { continue }
+        try { $candidateState = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+        $validation = Test-BackupState -State $candidateState -BackupPath $candidate.FullName
+        if ($validation.Valid -and -not $validation.Legacy -and @($candidateState.completedMutations).Count -gt 0 -and
+            (Test-Path -LiteralPath (Join-Path $candidate.FullName 'config.toml') -PathType Leaf)) { return $candidate.FullName }
+    }
+    return $null
+}
+
+
+--- /dev/null
++++ b/tests/Run-Tests.ps1
+#Requires -Version 5.1
+
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '..\scripts\CodexReconnect.Common.ps1')
+
+$script:Passed = 0
+$script:Failed = 0
+
+function Test-Case {
+    param([string]$Name, [scriptblock]$Body)
+    try { & $Body; Write-Host ("PASS {0}" -f $Name); $script:Passed++ }
+    catch { Write-Host ("FAIL {0}: {1}" -f $Name, $_.Exception.Message) -ForegroundColor Red; $script:Failed++ }
+}
+
+function Assert-Equal {
+    param($Actual, $Expected, [string]$Message = 'values differ')
+    if ($Actual -ne $Expected) { throw ("{0}: expected '{1}', got '{2}'" -f $Message, $Expected, $Actual) }
+}
+
+function Assert-True { param([bool]$Value, [string]$Message = 'expected true') if (-not $Value) { throw $Message } }
+function Assert-Throws { param([scriptblock]$Body) try { & $Body; throw 'expected an exception' } catch { if ($_.Exception.Message -eq 'expected an exception') { throw } } }
+
+Test-Case 'standard TOML repair preserves CRLF and comments' {
+    $input = "title = 'x'`r`n`r`n[features] # note`r`nrespect_system_proxy = false # keep`r`n"
+    $plan = Get-RespectSystemProxyPlan -Text $input
+    Assert-True $plan.Changed
+    Assert-True ($plan.Text.Contains("respect_system_proxy = true # keep`r`n"))
+    Assert-Equal ([regex]::Matches($plan.Text, '(?m)^\[features\]').Count) 1
+}
+
+Test-Case 'quoted TOML keys update one logical key' {
+    $input = "['features']`n'respect_system_proxy' = false`n"
+    $plan = Get-RespectSystemProxyPlan -Text $input
+    Assert-True ($plan.Text.Contains("'respect_system_proxy' = true"))
+    Assert-Equal (Get-RespectSystemProxyValue -Text $plan.Text) 'true'
+}
+
+Test-Case 'TOML keeps unrelated arrays and LF trailing-newline state' {
+    $input = "[[mcp_servers]]`nname = 'demo'`n`n[features] # note`njs_repl = false"
+    $plan = Get-RespectSystemProxyPlan -Text $input
+    Assert-True ($plan.Text.StartsWith("[[mcp_servers]]`nname = 'demo'"))
+    Assert-True (-not $plan.Text.EndsWith("`n"))
+    Assert-Equal (Get-RespectSystemProxyValue -Text $plan.Text) 'true'
+}
+
+Test-Case 'dotted feature plus explicit table is refused' {
+    Assert-Throws { Get-RespectSystemProxyPlan -Text "features.respect_system_proxy = false`n[features]`njs_repl = false`n" }
+}
+
+Test-Case 'unrelated TOML array tables remain supported' {
+    $input = "[[projects]]`nname = 'one'`n[features]`nrespect_system_proxy = false`n"
+    $plan = Get-RespectSystemProxyPlan -Text $input
+    Assert-True ($plan.Text.Contains('[[projects]]'))
+    Assert-Equal (Get-RespectSystemProxyValue -Text $plan.Text) 'true'
+}
+
+Test-Case 'duplicate TOML tables are refused' {
+    Assert-Throws { Get-RespectSystemProxyPlan -Text "[features]`na=1`n[\"features\"]`nb=2`n" }
+}
+
+Test-Case 'non-boolean feature value is refused' {
+    Assert-Throws { Get-RespectSystemProxyPlan -Text "[features]`nrespect_system_proxy = \"yes\"`n" }
+}
+
+Test-Case 'complex proxy routing is not safe to replace' {
+    $classification = Get-ProxyServerClassification -ProxyServer 'http=127.0.0.1:7890;https=127.0.0.1:7891'
+    Assert-True (-not $classification.SafeToReplace)
+    Assert-Equal $classification.Kind 'complex'
+}
+
+Test-Case 'PAC-style uncertainty cannot be diagnosed OK' {
+    Assert-Equal (Get-DiagnoseVerdict -RouteConfigured $false -RequiredProbeRan $true -RequiredProbePassed $true -HasFailure $false) 'UNVERIFIED'
+}
+
+Test-Case 'effective route prefers environment and supports ALL_PROXY' {
+    $route = Get-EffectiveProxyRoute -Environment ([pscustomobject]@{ HTTPS_PROXY=''; ALL_PROXY='http://127.0.0.1:32123'; HTTP_PROXY='' }) -FeatureEnabled $false -ProxyEnable 0 -ProxyServer '' -AutoConfigUrl '' -AutoDetect 0
+    Assert-Equal $route.Kind 'environment'
+    Assert-Equal $route.Source 'ALL_PROXY'
+    Assert-Equal $route.Port 32123
+    Assert-True $route.Verifiable
+}
+
+Test-Case 'per-protocol route selects HTTPS endpoint' {
+    $route = Get-EffectiveProxyRoute -Environment ([pscustomobject]@{ HTTPS_PROXY=''; ALL_PROXY=''; HTTP_PROXY='' }) -FeatureEnabled $true -ProxyEnable 1 -ProxyServer 'http=127.0.0.1:7890;https=127.0.0.1:47999' -AutoConfigUrl '' -AutoDetect 0
+    Assert-Equal $route.Kind 'system-per-protocol'
+    Assert-Equal $route.Port 47999
+    Assert-True $route.Verifiable
+}
+
+Test-Case 'PAC and WPAD routes remain explicitly unverified' {
+    $empty = [pscustomobject]@{ HTTPS_PROXY=''; ALL_PROXY=''; HTTP_PROXY='' }
+    $pac = Get-EffectiveProxyRoute -Environment $empty -FeatureEnabled $true -ProxyEnable 1 -ProxyServer '127.0.0.1:7890' -AutoConfigUrl 'http://proxy/pac?token=secret' -AutoDetect 0
+    $wpad = Get-EffectiveProxyRoute -Environment $empty -FeatureEnabled $true -ProxyEnable 1 -ProxyServer '127.0.0.1:7890' -AutoConfigUrl '' -AutoDetect 1
+    Assert-True (-not $pac.Verifiable)
+    Assert-True (-not $wpad.Verifiable)
+}
+
+Test-Case 'ALL_PROXY becomes the effective route' {
+    $route = Get-EffectiveProxyRoute -Environment ([pscustomobject]@{ HTTPS_PROXY=''; HTTP_PROXY=''; ALL_PROXY='http://127.0.0.1:8080' }) -FeatureEnabled $false -ProxyEnable 0 -ProxyServer '' -AutoConfigUrl '' -AutoDetect 0
+    Assert-Equal $route.Source 'ALL_PROXY'
+    Assert-True $route.Verifiable
+}
+
+Test-Case 'skipped and failed probes cannot be diagnosed OK' {
+    Assert-Equal (Get-DiagnoseVerdict -RouteConfigured $true -RequiredProbeRan $false -RequiredProbePassed $false -HasFailure $false) 'UNVERIFIED'
+    Assert-Equal (Get-DiagnoseVerdict -RouteConfigured $true -RequiredProbeRan $true -RequiredProbePassed $false -HasFailure $false) 'UNVERIFIED'
+}
+
+Test-Case 'credential-bearing proxy values are redacted' {
+    $safe = Protect-SensitiveText -Text 'HTTPS_PROXY=https://alice:secret@example.test:8443/path?access_token=xyz token=abc123'
+    Assert-True (-not $safe.Contains('secret'))
+    Assert-True (-not $safe.Contains('abc123'))
+    Assert-True (-not $safe.Contains('xyz'))
+}
+
+Test-Case 'transaction rolls back completed mutations in reverse order' {
+    $events = New-Object System.Collections.Generic.List[string]
+    $operations = @(
+        [pscustomobject]@{ Name='one'; Apply={ $events.Add('apply-one') }; Rollback={ $events.Add('undo-one') } },
+        [pscustomobject]@{ Name='two'; Apply={ $events.Add('apply-two') }; Rollback={ $events.Add('undo-two') } },
+        [pscustomobject]@{ Name='three'; Apply={ throw 'boom' }; Rollback={ $events.Add('undo-three') } }
+    )
+    $result = Invoke-RecoverableTransaction -Operations $operations
+    Assert-True (-not $result.Succeeded)
+    Assert-Equal ($events -join ',') 'apply-one,apply-two,undo-three,undo-two,undo-one'
+}
+
+Test-Case 'exact environment snapshot preserves existence and empty values' {
+    $snapshot = [pscustomobject]@{
+        HTTP_PROXY = [pscustomobject]@{ Exists = $true; Value = '' }
+        HTTPS_PROXY = [pscustomobject]@{ Exists = $true; Value = 'http://old:1' }
+        ALL_PROXY = [pscustomobject]@{ Exists = $false; Value = $null }
+        NO_PROXY = [pscustomobject]@{ Exists = $true; Value = 'localhost' }
+    }
+    $plan = Get-EnvironmentRestorePlan -Snapshot $snapshot -Names @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')
+    Assert-True $plan[0].Exists
+    Assert-Equal $plan[0].Value ''
+    Assert-True (-not $plan[2].Exists)
+    Assert-Equal $plan[2].Value $null
+    $plan = Get-EnvironmentRestorePlan -Snapshot $snapshot -Names @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')
+    Assert-True $plan[0].Exists
+    Assert-Equal $plan[0].Value ''
+    Assert-True (-not $plan[2].Exists)
+    Assert-Equal $plan[2].Value $null
+}
+
+Test-Case 'malformed and partial rollback states are rejected' {
+    Assert-True (-not (Test-BackupState -State $null -BackupPath '.').Valid)
+    $partial = [pscustomobject]@{ schemaVersion=2; mutationId='x'; codexHome='C:\x'; completedMutations=@('config'); completed=$false }
+    Assert-True (-not (Test-BackupState -State $partial -BackupPath '.').Valid)
+}
+
+Test-Case 'only complete mutation backups validate for automatic rollback' {
+    $environment = [pscustomobject]@{
+        HTTP_PROXY=[pscustomobject]@{Exists=$false;Value=$null}; HTTPS_PROXY=[pscustomobject]@{Exists=$false;Value=$null}
+        ALL_PROXY=[pscustomobject]@{Exists=$false;Value=$null}; NO_PROXY=[pscustomobject]@{Exists=$false;Value=$null}
+    }
+    $state = [pscustomobject]@{
+        schemaVersion=2; mutationId='abc'; codexHome='C:\codex'; configPath='C:\codex\config.toml'
+        completedMutations=@('config'); completed=$true; environment=$environment
+        proxyEnable=[pscustomobject]@{exists=$true;value=0}; proxyServer=[pscustomobject]@{exists=$true;value=''}
+        autoConfigUrl=[pscustomobject]@{exists=$false;value=$null}; autoDetect=[pscustomobject]@{exists=$false;value=$null}
+    }
+    Assert-True (Test-BackupState -State $state -BackupPath '.').Valid
+    $state.completedMutations = @()
+    Assert-Equal @($state.completedMutations).Count 0
+}
+
+Test-Case 'launcher unblocks only its selected target' {
+    foreach ($name in @('Fix.cmd', 'Diagnose.cmd', 'Rollback.cmd')) {
+        $text = Get-Content -LiteralPath (Join-Path $PSScriptRoot "..\$name") -Raw
+        Assert-True ($text -match "Unblock-File -LiteralPath '%TARGET%'")
+        Assert-True ($text -notmatch 'Get-ChildItem.+\*\.ps1')
+    }
+}
+
+Test-Case 'CODEX_HOME is preferred over USERPROFILE' {
+    $oldCodexHome = $env:CODEX_HOME
+    $oldUserProfile = $env:USERPROFILE
+    try {
+        $env:CODEX_HOME = (Join-Path ([System.IO.Path]::GetTempPath()) 'codex-home-test')
+        $env:USERPROFILE = (Join-Path ([System.IO.Path]::GetTempPath()) 'profile-test')
+        Assert-Equal (Get-DefaultCodexHome) ([System.IO.Path]::GetFullPath($env:CODEX_HOME))
+    } finally {
+        $env:CODEX_HOME = $oldCodexHome
+        $env:USERPROFILE = $oldUserProfile
+    }
+}
+
+Test-Case 'argument bounds reject invalid ports and timeouts' {
+    Assert-Throws { Assert-CodexReconnectParameters -Port 70000 -TimeoutSec 10 }
+    Assert-Throws { Assert-CodexReconnectParameters -Port 7890 -TimeoutSec 0 }
+}
+
+Test-Case 'backup selection ignores newer empty and partial folders' {
+    $root = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-reconnect-tests-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $valid = New-Item -ItemType Directory -Path (Join-Path $root 'valid') -Force
+        $partial = New-Item -ItemType Directory -Path (Join-Path $root 'partial') -Force
+        $validState = [ordered]@{
+            schemaVersion=2; mutationId='valid'; codexHome='C:\codex'; configPath='C:\codex\config.toml'
+            completedMutations=@('config'); completed=$true
+            proxyEnable=@{exists=$true;value=0}; proxyServer=@{exists=$true;value=''}
+            autoConfigUrl=@{exists=$false;value=$null}; autoDetect=@{exists=$false;value=$null}
+            environment=@{
+                HTTP_PROXY=@{Exists=$false;Value=$null}; HTTPS_PROXY=@{Exists=$false;Value=$null}
+                ALL_PROXY=@{Exists=$false;Value=$null}; NO_PROXY=@{Exists=$false;Value=$null}
+            }
+        }
+        $partialState = [ordered]@{}; foreach ($key in $validState.Keys) { $partialState[$key] = $validState[$key] }
+        $partialState.mutationId='partial'; $partialState.completed=$false
+        [System.IO.File]::WriteAllText((Join-Path $valid.FullName 'state.json'), ($validState | ConvertTo-Json -Depth 8))
+        [System.IO.File]::WriteAllText((Join-Path $valid.FullName 'config.toml'), '[features]')
+        Start-Sleep -Milliseconds 20
+        [System.IO.File]::WriteAllText((Join-Path $partial.FullName 'state.json'), ($partialState | ConvertTo-Json -Depth 8))
+        Assert-Equal (Find-LatestValidMutationBackup -Root $root) $valid.FullName
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+    }
+}
+
+Write-Host ''
+Write-Host ("{0} passed, {1} failed" -f $script:Passed, $script:Failed)
+if ($script:Failed -gt 0) { exit 1 }
+exit 0
+

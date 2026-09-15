@@ -62,13 +62,23 @@
 [CmdletBinding()]
 param(
     [int]$Port = 0,
-    [string]$CodexHome = (Join-Path $env:USERPROFILE '.codex'),
+    [string]$CodexHome,
     [switch]$SkipNetworkTest,
     [int]$TimeoutSec = 12,
     [string]$ReportPath
 )
 
 $ErrorActionPreference = 'Stop'
+
+. (Join-Path $PSScriptRoot 'CodexReconnect.Common.ps1')
+
+try {
+    Assert-CodexReconnectParameters -Port $Port -TimeoutSec $TimeoutSec
+    $CodexHome = Resolve-CodexReconnectHome -RequestedHome $CodexHome
+} catch {
+    Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    exit 2
+}
 
 # ---------------------------------------------------------------------------
 # output helpers
@@ -87,8 +97,9 @@ $script:ListeningPorts    = @()
 
 function Out-Line {
     param([string]$Text = '')
-    $script:Report.Add($Text)
-    Write-Host $Text
+    $safeText = Protect-SensitiveText -Text $Text
+    $script:Report.Add($safeText)
+    Write-Host $safeText
 }
 
 function Out-Row {
@@ -99,7 +110,7 @@ function Out-Row {
         'fail' { 'FAIL' }
         default { '    ' }
     }
-    Out-Line ('    {0} {1,-22}: {2}' -f $tag, $Label, $Value)
+    Out-Line ('    {0} {1,-22}: {2}' -f $tag, $Label, (Protect-SensitiveText -Text $Value))
 }
 
 function Add-Finding {
@@ -117,7 +128,7 @@ function Get-SystemProxyState {
         $p = Get-ItemProperty -Path $reg -ErrorAction Stop
     } catch {
         return [pscustomobject]@{
-            Readable = $false; ProxyEnable = 0; ProxyServer = ''; AutoConfigURL = ''
+            Readable = $false; ProxyEnable = 0; ProxyServer = ''; AutoConfigURL = ''; AutoDetect = 0
         }
     }
     [pscustomobject]@{
@@ -125,6 +136,7 @@ function Get-SystemProxyState {
         ProxyEnable   = [int]$p.ProxyEnable
         ProxyServer   = [string]$p.ProxyServer
         AutoConfigURL = [string]$p.AutoConfigURL
+        AutoDetect    = [int]$p.AutoDetect
     }
 }
 
@@ -505,6 +517,11 @@ if ($portInfo.Candidates.Count -gt 1) {
 $envProxyOk = $false
 $featureOk  = $false
 $systemOk   = $false
+$routeConfigured = $false
+$httpProxy = [System.Environment]::GetEnvironmentVariable('HTTP_PROXY')
+$httpsProxy = [System.Environment]::GetEnvironmentVariable('HTTPS_PROXY')
+$allProxy = [System.Environment]::GetEnvironmentVariable('ALL_PROXY')
+$envProxyOk = [bool]($httpProxy -or $httpsProxy -or $allProxy)
 
 # ---- [1] Windows system proxy --------------------------------------------
 Out-Line '[1] Windows system proxy  (HKCU\...\Internet Settings)'
@@ -512,19 +529,19 @@ if (-not $proxyState.Readable) {
     Out-Row -Label 'Registry' -Value 'could not be read' -State 'warn'
 } else {
     $expected = "127.0.0.1:$portValue"
-    $systemOk = ($proxyState.ProxyEnable -eq 1 -and $proxyState.ProxyServer.Trim() -eq $expected)
+    $proxyClassification = Get-ProxyServerClassification -ProxyServer $proxyState.ProxyServer
+    $systemOk = ($proxyState.ProxyEnable -eq 1 -and $proxyClassification.Kind -eq 'simple-local' -and $proxyClassification.Port -eq $portValue -and [string]::IsNullOrEmpty($proxyState.AutoConfigURL))
 
     if ($proxyState.ProxyEnable -eq 1) {
         Out-Row -Label 'ProxyEnable' -Value '1 (on)' -State 'ok'
     } else {
-        Out-Row -Label 'ProxyEnable' -Value '0 (system proxy is OFF)' -State 'fail'
-        Add-Finding 'fail' ('The Windows system proxy is disabled. Even with respect_system_proxy = true, ' +
-                             'the Codex backend has nothing to respect. Enable the system proxy in your proxy client.')
+        Out-Row -Label 'ProxyEnable' -Value '0 (system proxy is OFF)' -State $(if ($envProxyOk) { 'warn' } else { 'fail' })
+        Add-Finding 'warn' 'The Windows system proxy is disabled; this is acceptable only when a working proxy environment variable supplies the route.'
     }
 
     if ($proxyState.ProxyServer -eq '') {
         Out-Row -Label 'ProxyServer' -Value '(empty)' -State $(if ($systemOk) { 'ok' } else { 'warn' })
-    } elseif ($proxyState.ProxyServer.Trim() -eq $expected) {
+    } elseif ($proxyClassification.Kind -eq 'simple-local' -and $proxyClassification.Port -eq $portValue) {
         Out-Row -Label 'ProxyServer' -Value $proxyState.ProxyServer -State 'ok'
     } else {
         Out-Row -Label 'ProxyServer' -Value ("{0}   (expected {1})" -f $proxyState.ProxyServer, $expected) -State 'warn'
@@ -544,6 +561,9 @@ if (-not $proxyState.Readable) {
     } else {
         Out-Row -Label 'AutoConfigURL' -Value '(none)' -State 'ok'
     }
+    if ($proxyClassification.Kind -in @('complex', 'custom')) {
+        Add-Finding 'warn' 'The system proxy uses complex routing that cannot be verified by a single local-port probe.'
+    }
 }
 Out-Line ''
 
@@ -560,9 +580,6 @@ foreach ($name in $envNames) {
         Out-Row -Label $name -Value '(not set)' -State ''
     }
 }
-$httpProxy = [System.Environment]::GetEnvironmentVariable('HTTP_PROXY')
-$httpsProxy = [System.Environment]::GetEnvironmentVariable('HTTPS_PROXY')
-$envProxyOk = [bool]($httpProxy -or $httpsProxy)
 Out-Line ''
 
 # ---- [3] Codex feature switch --------------------------------------------
@@ -573,60 +590,58 @@ if (-not (Test-Path $configPath)) {
 } else {
     Out-Row -Label 'config.toml' -Value $configPath -State 'ok'
     $raw = Get-Content -Path $configPath -Raw -Encoding UTF8
-    $flagValue = Get-TomlScalar -Text $raw -Table 'features' -Key 'respect_system_proxy'
-    $featureOk = Test-Truthy $flagValue
+    try {
+        $flagValue = Get-RespectSystemProxyValue -Text $raw
+        $featureOk = Test-TomlTrue $flagValue
+    } catch {
+        $flagValue = $null
+        $featureOk = $false
+        Add-Finding 'fail' ("config.toml is invalid or ambiguous: {0}" -f $_.Exception.Message)
+    }
 
     if ($featureOk) {
         Out-Row -Label 'respect_system_proxy' -Value 'true' -State 'ok'
     } elseif ($null -eq $flagValue) {
-        Out-Row -Label 'respect_system_proxy' -Value 'absent from [features]' -State 'fail'
-        Add-Finding 'fail' 'respect_system_proxy is not set. The Codex backend will ignore the Windows system proxy and try to connect directly.'
+        Out-Row -Label 'respect_system_proxy' -Value 'absent from [features]' -State $(if ($envProxyOk) { 'warn' } else { 'fail' })
+        Add-Finding $(if ($envProxyOk) { 'warn' } else { 'fail' }) 'respect_system_proxy is absent. A working proxy environment variable can still supply the route.'
     } else {
-        Out-Row -Label 'respect_system_proxy' -Value ("{0} (not enabled)" -f $flagValue) -State 'fail'
-        Add-Finding 'fail' 'respect_system_proxy is set but not true. The Codex backend will ignore the Windows system proxy.'
+        Out-Row -Label 'respect_system_proxy' -Value ("{0} (not enabled)" -f $flagValue) -State $(if ($envProxyOk) { 'warn' } else { 'fail' })
+        Add-Finding $(if ($envProxyOk) { 'warn' } else { 'fail' }) 'respect_system_proxy is not true. A working proxy environment variable can still supply the route.'
     }
 }
 Out-Line ''
 
+$effectiveRoute = Get-EffectiveProxyRoute -Environment ([pscustomobject]@{
+    HTTP_PROXY = $httpProxy; HTTPS_PROXY = $httpsProxy; ALL_PROXY = $allProxy
+}) -FeatureEnabled $featureOk -ProxyEnable $proxyState.ProxyEnable -ProxyServer $proxyState.ProxyServer -AutoConfigUrl $proxyState.AutoConfigURL -AutoDetect $proxyState.AutoDetect
+
 # ---- [4] proxy port reachability -----------------------------------------
 $portOpen = $null
-if (-not $SkipNetworkTest) {
-    Out-Line '[4] Proxy port reachability'
-    $portOpen = Test-TcpPort -TargetHost '127.0.0.1' -TargetPort $portValue
+if (-not $SkipNetworkTest -and $effectiveRoute.Verifiable) {
+    Out-Line '[4] Selected proxy endpoint reachability'
+    $portOpen = Test-TcpPort -TargetHost $effectiveRoute.Host -TargetPort $effectiveRoute.Port
     if ($portOpen) {
-        Out-Row -Label ("127.0.0.1:{0}" -f $portValue) -Value 'accepting TCP connections' -State 'ok'
+        Out-Row -Label ("{0}:{1}" -f $effectiveRoute.Host, $effectiveRoute.Port) -Value ("accepting TCP connections ({0})" -f $effectiveRoute.Source) -State 'ok'
     } else {
-        Out-Row -Label ("127.0.0.1:{0}" -f $portValue) -Value 'closed - nothing is listening' -State 'fail'
-
-        $liveAlternatives = @($portInfo.Candidates | Where-Object { $_.Live -eq $true -and [int]$_.Port -ne $portValue } |
-                              ForEach-Object { $_.Port })
-
-        if ($portInfo.Authoritative) {
-            Add-Finding 'fail' ("Nothing answers on 127.0.0.1:{0}, which is the port your Windows system proxy is set to. " -f $portValue) +
-                                'Start the proxy client - without a live local proxy port nothing can be fixed by configuration alone.'
-        } elseif ($portInfo.Forced) {
-            Add-Finding 'fail' ("Nothing answers on 127.0.0.1:{0}, the port you passed with -Port. " -f $portValue) +
-                                'Either the proxy client is not running, or that is not its inbound port.'
-        } else {
-            $hint = ("Nothing answers on 127.0.0.1:{0}, and {0} was only a guess: no proxy client was detected and the " -f $portValue) +
-                    'Windows system proxy does not name a port. Your real local port is probably different.'
-            if ($liveAlternatives.Count -gt 0) {
-                $hint += (' A live port was found on this machine though: {0} - retry with -Port {1}.' -f
-                          (($liveAlternatives -join ', ')), $liveAlternatives[0])
-            } else {
-                $hint += ' Start your proxy client, then re-run this check.'
-            }
-            Add-Finding 'fail' $hint
-        }
+        Out-Row -Label ("{0}:{1}" -f $effectiveRoute.Host, $effectiveRoute.Port) -Value 'closed or unreachable' -State 'fail'
+        Add-Finding 'fail' ("The selected route from {0} is not accepting TCP connections." -f $effectiveRoute.Source)
     }
+    Out-Line ''
+} elseif (-not $SkipNetworkTest) {
+    Out-Line '[4] Selected proxy endpoint reachability'
+    Out-Row -Label $effectiveRoute.Source -Value $effectiveRoute.Reason -State 'warn'
+    Out-Line ''
+} else {
+    Out-Line '[4] Selected proxy endpoint reachability'
+    Out-Row -Label 'Status' -Value 'not tested (-SkipNetworkTest)' -State 'warn'
     Out-Line ''
 }
 
 # ---- [5] end-to-end probes -----------------------------------------------
 $proxyRequest = $null
-if (-not $SkipNetworkTest) {
+if (-not $SkipNetworkTest -and $effectiveRoute.Verifiable) {
     Out-Line '[5] End-to-end probes'
-    $proxyUrl = "http://127.0.0.1:$portValue"
+    $proxyUrl = $effectiveRoute.ProxyUrl
 
     $proxyRequest = Test-ProxiedRequest -Url 'https://chatgpt.com/backend-api/me' -ProxyUrl $proxyUrl -Timeout $TimeoutSec
     if ($proxyRequest.Ok) {
@@ -634,7 +649,7 @@ if (-not $SkipNetworkTest) {
         Out-Row -Label 'via proxy (chatgpt.com)' -Value $proxyRequest.Detail -State 'ok'
     } else {
         Out-Row -Label 'via proxy (chatgpt.com)' -Value ('failed - ' + $proxyRequest.Detail) -State 'fail'
-        $chainHint = ("The local proxy at 127.0.0.1:{0} cannot reach chatgpt.com. " -f $portValue) +
+        $chainHint = ("The selected proxy route '{0}' cannot reach chatgpt.com. " -f (Protect-SensitiveText -Text $proxyUrl)) +
                      'The proxy chain itself is the problem (dead node / expired subscription / wrong outbound). Fix that first.'
         Add-Finding 'fail' $chainHint
     }
@@ -646,10 +661,21 @@ if (-not $SkipNetworkTest) {
         Out-Row -Label 'direct TCP 443' -Value 'blocked - a working proxy is mandatory here' -State 'warn'
     }
     Out-Line ''
+} elseif (-not $SkipNetworkTest) {
+    Out-Line '[5] End-to-end probes'
+    Out-Row -Label 'selected route' -Value $effectiveRoute.Reason -State 'warn'
+    Out-Line ''
+} else {
+    Out-Line '[5] End-to-end probes'
+    Out-Row -Label 'Status' -Value 'not tested (-SkipNetworkTest)' -State 'warn'
+    Out-Line ''
 }
 
 # ---- verdict -------------------------------------------------------------
 $rootCauseHit = (-not $featureOk) -and (-not $envProxyOk)
+$routeConfigured = [bool]$effectiveRoute.Configured
+$hasFailure = [bool]($script:Findings | Where-Object { $_.Severity -eq 'fail' })
+$verdict = Get-DiagnoseVerdict -RouteConfigured $routeConfigured -RequiredProbeRan (-not $SkipNetworkTest) -RequiredProbePassed ([bool]($proxyRequest -and $proxyRequest.Ok)) -HasFailure $hasFailure
 
 Out-Line '-------------------------------------------------------------'
 if ($rootCauseHit) {
@@ -660,20 +686,25 @@ if ($rootCauseHit) {
     Out-Line '   * [features] respect_system_proxy is not enabled in config.toml, and'
     Out-Line '   * no HTTP_PROXY / HTTPS_PROXY / ALL_PROXY environment variable is set.'
     Out-Line ''
-    Out-Line ' The Rust backend (ReqwestDefault strategy) only honours proxy environment'
-    Out-Line ' variables - it never reads the Windows system proxy. So requests go direct,'
-    Out-Line ' get blocked, and the client retries 5 times before degrading to plain HTTP.'
+    Out-Line ' The backend honours proxy environment variables directly, or the Windows'
+    Out-Line ' system proxy when respect_system_proxy is enabled. Neither route is active,'
+    Out-Line ' so requests go direct and can enter the reconnect loop.'
     Out-Line ''
     Out-Line ' Fix: run .\Fix-CodexReconnect.ps1   then restart the Codex / ChatGPT desktop app.'
-} elseif ($featureOk -and $systemOk -and ($portOpen -ne $false)) {
+} elseif ($verdict -eq 'OK') {
     Out-Line ' VERDICT: OK - configuration is consistent'
     Out-Line '-------------------------------------------------------------'
     Out-Line ''
-    Out-Line ' The backend is allowed to use the system proxy and the proxy is alive.'
+    Out-Line (" The backend route through {0} passed the end-to-end probe." -f $effectiveRoute.Source)
     Out-Line ' If you still see "Reconnecting 1/5", the proxy chain itself is likely at fault:'
     Out-Line '   * test another node / protocol inside your proxy client'
     Out-Line '   * check whether the subscription is expired'
     Out-Line '   * prefer a node that does not rely on QUIC/UDP if WebSocket fallback matters'
+} elseif ($verdict -eq 'UNVERIFIED') {
+    Out-Line ' VERDICT: UNVERIFIED - required route evidence is missing'
+    Out-Line '-------------------------------------------------------------'
+    Out-Line ''
+    Out-Line ' A configured route was found, but the required live probe was skipped, failed, or did not verify that route.'
 } else {
     Out-Line ' VERDICT: PROBLEM(S) FOUND - see the FAIL/WARN rows above'
     Out-Line '-------------------------------------------------------------'
@@ -701,5 +732,5 @@ if ($ReportPath) {
 }
 
 if (-not (Test-Path $CodexHome)) { exit 2 }
-if ($script:Findings | Where-Object { $_.Severity -eq 'fail' }) { exit 1 }
+if ($verdict -ne 'OK') { exit 1 }
 exit 0

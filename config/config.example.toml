@@ -3,6 +3,8 @@
 # Merge the keys below into your own ~/.codex/config.toml.
 # Do NOT overwrite the whole file - Codex stores your plugins, trusted projects
 # and desktop preferences there too.
+# If [features] already exists, copy only respect_system_proxy into that table;
+# TOML does not allow a second logical [features] table (quoted names count too).
 #
 # Notes
 #   * The file must be UTF-8 WITHOUT BOM. A BOM makes the TOML parser fail and

@@ -27,10 +27,10 @@ if not exist "%TARGET%" (
 )
 
 echo ============================================================
-echo  Codex Reconnect - DIAGNOSE   (read-only, changes nothing)
+echo  Codex Reconnect - DIAGNOSE   (diagnostic script is read-only)
 echo ============================================================
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -LiteralPath '%HERE%scripts' -Filter *.ps1 -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Unblock-File -LiteralPath '%TARGET%' -ErrorAction SilentlyContinue" >nul 2>&1
 powershell -NoProfile -ExecutionPolicy Bypass -File "%TARGET%" %*
 set "RC=%ERRORLEVEL%"
 echo.
