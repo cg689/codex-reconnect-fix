@@ -219,6 +219,19 @@ Test-Case 'backup selection ignores newer empty and partial folders' {
     }
 }
 
+Test-Case 'atomic overwrite replaces an existing config file' {
+    $path = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-reconnect-test-{0}.toml' -f [guid]::NewGuid().ToString('N'))
+    try {
+        Write-AtomicTextFile -Path $path -Text 'respect_system_proxy = false'
+        Write-AtomicTextFile -Path $path -Text 'respect_system_proxy = true'
+        Assert-Equal (Get-Content -Raw -LiteralPath $path) 'respect_system_proxy = true'
+        Write-AtomicBytes -Path $path -Bytes ([System.Text.Encoding]::UTF8.GetBytes('respect_system_proxy = false'))
+        Assert-Equal (Get-Content -Raw -LiteralPath $path) 'respect_system_proxy = false'
+    } finally {
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 Write-Host ''
 Write-Host ("{0} passed, {1} failed" -f $script:Passed, $script:Failed)
 if ($script:Failed -gt 0) { exit 1 }

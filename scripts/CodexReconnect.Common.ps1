@@ -254,7 +254,7 @@ function Write-AtomicTextFile {
     try {
         [System.IO.File]::WriteAllText($temporary, $Text, $script:CodexReconnectUtf8NoBom)
         if (Test-Path -LiteralPath $fullPath) {
-            [System.IO.File]::Replace($temporary, $fullPath, $null)
+            [System.IO.File]::Replace($temporary, $fullPath, [System.Management.Automation.Language.NullString]::Value)
         } else {
             [System.IO.File]::Move($temporary, $fullPath)
         }
@@ -271,7 +271,7 @@ function Write-AtomicBytes {
     $temporary = Join-Path $directory ('.codex-reconnect-{0}.tmp' -f [guid]::NewGuid().ToString('N'))
     try {
         [System.IO.File]::WriteAllBytes($temporary, $Bytes)
-        if (Test-Path -LiteralPath $fullPath) { [System.IO.File]::Replace($temporary, $fullPath, $null) }
+        if (Test-Path -LiteralPath $fullPath) { [System.IO.File]::Replace($temporary, $fullPath, [System.Management.Automation.Language.NullString]::Value) }
         else { [System.IO.File]::Move($temporary, $fullPath) }
     } finally {
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
